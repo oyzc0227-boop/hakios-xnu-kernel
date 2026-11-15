@@ -588,6 +588,24 @@ static const struct platform platform_redwood = {
 	.small_cores = 0x0f,
 };
 
+/*
+ * The Mi 11 Lite 5G (renoir, SM7350 "shima"). The SoC's facts the loader needs are the SM7325 family's too -- the
+ * same GIC (dist 0x17A00000, redist 0x17A60000), the same bus window, eight cores numbered in MPIDR's second
+ * affinity field -- and the panel's splash region is at the same 0xE1000000 (devices/renoir: its device tree's
+ * cont_splash_region), which is how the phone is recognised below. It is a separate entry so that the log says
+ * the phone it is, and so that a core layout that differs can be written here.
+ *
+ * The cores are three ranks, not two: capacity-dmips-mhz is 1985 on core 7 (the Cortex-X1), 1946 on 4-6 (A78)
+ * and 1024 on 0-3 (A55). small_cores marks 0-3 as on the reference phone; the X1 is core 7, so the loader's
+ * "run on the biggest core" (bootcpu=7) picks it.
+ */
+static const struct platform platform_renoir = {
+	.name = "renoir", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
+	.cores = 8, .core_shift = 8,
+	.small_cores = 0x0f,
+};
+
 /* ------------------------------------------------------------------------ */
 
 static void
@@ -2822,6 +2840,47 @@ choose_window(const struct payload_info *pi)
  */
 static int starts_with(const char *s, const char *prefix);
 
+/*
+ * The payload's command line, read straight from the payload in memory, before parse_payload() fills in the struct:
+ * what is asked of the platform selection at start-up is in it (hakios_device=). NULL when there is no payload or no
+ * command line in it. The walk uses the same limits as parse_payload().
+ */
+static const char *
+payload_cmdline(void)
+{
+	const uint8_t *base = (const uint8_t *)(uintptr_t)PAYLOAD_BASE;
+	const struct payload_header *h = (const struct payload_header *)base;
+
+	if (h->magic != PAYLOAD_MAGIC || h->size > PAYLOAD_MAX_SIZE || h->size < sizeof(*h)) {
+		return NULL;
+	}
+	const uint8_t *cursor = base + sizeof(*h), *end = base + h->size;
+	while (cursor + sizeof(struct payload_entry) <= end) {
+		const struct payload_entry *e = (const struct payload_entry *)cursor;
+		const char *name = e->name;
+		if (starts_with(name, "cmdline") && name[7] == 0) {
+			return (const char *)cursor + sizeof(*e);
+		}
+		cursor += sizeof(*e) + ((e->size + 15) & ~15u);
+	}
+	return NULL;
+}
+
+/* Is NAME= in the command line (a whole word, as parse_payload's callers check theirs)? */
+static int
+cmdline_has(const char *cmdline, const char *arg)
+{
+	if (cmdline == NULL) {
+		return 0;
+	}
+	for (const char *c = cmdline; *c; c++) {
+		if ((c == cmdline || c[-1] == ' ') && starts_with(c, arg)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static int
 run_kernel(int have_checkpoint, uint64_t checkpoint)
 {
@@ -4344,7 +4403,18 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.height = GOP->mode->info->height;
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
 		if (SCREEN.base == 0xE1000000ULL) {
-			PLAT = &platform_redwood;
+			/*
+			 * Two phones put their splash region here: the POCO X5 Pro 5G (redwood, SM7325) and the Mi 11
+			 * Lite 5G (renoir, SM7350). Their SoC's facts are the same, so the platform is either's; which
+			 * one it is decides only what the log calls it. The payload says, when whoever packed it knew:
+			 * hakios_device=<name> in the command line (tools/make-kernel.sh and ./xl pass it from the
+			 * device the image was packed for). Without it, the reference phone, as before.
+			 */
+			if (cmdline_has(payload_cmdline(), "hakios_device=renoir")) {
+				PLAT = &platform_renoir;
+			} else {
+				PLAT = &platform_redwood;
+			}
 		} else {
 			ramfb_phone_screen();
 		}
