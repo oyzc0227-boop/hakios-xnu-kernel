@@ -81,16 +81,103 @@ sleep_ms(uint32_t ms)
 #define PULL_NONE               0
 #define PULL_UP                 3
 
-#define PIN_MISO                52
-#define PIN_MOSI                53
-#define PIN_CLK                 54
-#define PIN_CS                  55
-#define PIN_INT                 81      /* low = the chip has a report */
-#define PIN_RESET               105     /* low = in reset */
-#define PIN_AVDD                107     /* high = analog supply on */
-#define PIN_FOCALTECH_ID        68      /* FocalTech if this reads 0 ... */
-#define PIN_GOODIX_ID           96      /* ... and this reads 1 (sm8350-kernel-OKX convention) */
-#define PIN_FUNCTION_SPI        1       /* "qup15" */
+/*
+ * The numbers below belong to the phone the driver was written for, and another phone's differ: the SPI bus is another
+ * serial engine, the pins are other pins, the supplies are other regulators. They are read from this table, which
+ * hw_select() fills in from the device the kernel says it is on (boot-arg hakios_device=<name>, the one ./xl and the run
+ * scripts pass; see xnuloader/loader.c for the same argument). A value of PIN_NONE means "this phone has none of it".
+ *
+ * The reference phone is the one this driver was written on (the POCO X5 Pro 5G, redwood): with nothing saying otherwise
+ * its values are used, so a kernel built before this table existed behaves as it did.
+ */
+#define PIN_NONE                0xffffu
+#define LDO_NONE                NULL
+
+struct touch_hw {
+	/* what the phone is called (the boot-arg's value that selects this row) */
+	const char *device;
+
+	/* the SPI bus: four pins in the engine's order (MISO, MOSI, CLK, CS), and the engine itself */
+	unsigned pin_miso, pin_mosi, pin_clk, pin_cs;
+	uint32_t se_phys;
+
+	/* the interrupt line and the reset line */
+	unsigned pin_int, pin_reset;
+
+	/* the analog supply: a GPIO that switches it (PIN_NONE when it is a regulator instead) */
+	unsigned pin_avdd;
+
+	/* the straps the board uses to say which controller it has (PIN_NONE when the board does not) */
+	unsigned pin_focaltech_id, pin_goodix_id;
+
+	/*
+	 * Which controller, when the straps do not say: 0 = read the straps (the reference phone's board does), 1 = a
+	 * Goodix, 2 = a FocalTech. The Mi 11 Lite 5G's board straps nothing -- its device tree names one node carrying
+	 * both controllers' properties, and Android ran the FocalTech driver on it.
+	 */
+	int chip_forced;
+
+	/* the regulators, by their names in the RPMh command database, and the millivolts to ask of each */
+	const char *iovdd_ldo;
+	unsigned iovdd_mv;
+	const char *avdd_ldo;
+	unsigned avdd_mv;
+
+	/* the serial engine's clocks in the global clock controller */
+	uint32_t m_ahb_cbcr, s_ahb_cbcr, se_cbcr, se_cmd, se_cfg, se_dfsr;
+	uint32_t perf_cfg, perf_m, perf_n;
+	uint32_t vote_core_2x, vote_core, vote_m_ahb, vote_s_ahb, vote_se;
+};
+
+static const struct touch_hw hw_redwood = {
+	.device = "redwood",
+	.pin_miso = 52, .pin_mosi = 53, .pin_clk = 54, .pin_cs = 55,
+	.se_phys = 0x00a94000UL,
+	.pin_int = 81, .pin_reset = 105, .pin_avdd = 107,
+	.pin_focaltech_id = 68, .pin_goodix_id = 96, .chip_forced = 0,
+	.iovdd_ldo = "ldoc2", .iovdd_mv = 1800, .avdd_ldo = LDO_NONE, .avdd_mv = 0,
+	.m_ahb_cbcr = 0x18004, .s_ahb_cbcr = 0x18008, .se_cbcr = 0x185fc, .se_cmd = 0x18600,
+	.se_cfg = 0x18604, .se_dfsr = 0x18614, .perf_cfg = 0x1861c, .perf_m = 0x1865c, .perf_n = 0x1869c,
+	.vote_core_2x = 1u << 18, .vote_core = 1u << 19, .vote_m_ahb = 1u << 20, .vote_s_ahb = 1u << 21,
+	.vote_se = 1u << 27,
+};
+
+/*
+ * The Mi 11 Lite 5G (renoir, SM7350 "shima"): a FocalTech FT3658U on serial engine 10, whose four pins are GPIO 20-23
+ * (devices: its own device tree, qupv3_se10_spi_active, function "qup10"), interrupt GPIO 31 and reset GPIO 30, avdd from
+ * PM8350C's LDO7 at 3.0 V, iovdd from its LDO2. The engine is QUP0's second, so its clocks sit in the first group of the
+ * global clock controller (CBCR 0x1726c, command 0x17270) and its votes are bits 6-12 where the reference phone's are
+ * 18-27 (drivers/clk/qcom/gcc-shima.c, the same file for both SoCs).
+ *
+ * The board does not strap which controller it has: its device tree names one node with both controllers' properties and
+ * Android ran the FocalTech driver ("fts_ts" on 988000.spi). So this row says FocalTech outright.
+ */
+static const struct touch_hw hw_renoir = {
+	.device = "renoir",
+	.pin_miso = 20, .pin_mosi = 21, .pin_clk = 22, .pin_cs = 23,
+	.se_phys = 0x00988000UL,
+	.pin_int = 31, .pin_reset = 30, .pin_avdd = PIN_NONE,
+	.pin_focaltech_id = PIN_NONE, .pin_goodix_id = PIN_NONE, .chip_forced = 2,   /* FocalTech: see above */
+	.iovdd_ldo = "ldoc2", .iovdd_mv = 1620, .avdd_ldo = "ldoc7", .avdd_mv = 3000,
+	.m_ahb_cbcr = 0x17004, .s_ahb_cbcr = 0x17008, .se_cbcr = 0x1726c, .se_cmd = 0x17270,
+	.se_cfg = 0x17274, .se_dfsr = 0x17284, .perf_cfg = 0x1728c, .perf_m = 0x172cc, .perf_n = 0x1730c,
+	.vote_core_2x = 1u << 9, .vote_core = 1u << 8, .vote_m_ahb = 1u << 6, .vote_s_ahb = 1u << 7,
+	.vote_se = 1u << 12,
+};
+
+static const struct touch_hw *hw = &hw_redwood;
+
+/* the same names as before, now the selected phone's numbers */
+#define PIN_MISO                (hw->pin_miso)
+#define PIN_MOSI                (hw->pin_mosi)
+#define PIN_CLK                 (hw->pin_clk)
+#define PIN_CS                  (hw->pin_cs)
+#define PIN_INT                 (hw->pin_int)      /* low = the chip has a report */
+#define PIN_RESET               (hw->pin_reset)    /* low = in reset */
+#define PIN_AVDD                (hw->pin_avdd)     /* high = analog supply on (PIN_NONE: see avdd_supply_on) */
+#define PIN_FOCALTECH_ID        (hw->pin_focaltech_id)
+#define PIN_GOODIX_ID           (hw->pin_goodix_id)
+#define PIN_FUNCTION_SPI        1       /* the serial engine's function in TLMM (qup15 there, qup10 here: both funcsel 1) */
 
 static void
 gpio_configure(unsigned pin, unsigned function, unsigned pull, unsigned ma, bool output)
@@ -247,26 +334,42 @@ rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
 	return done;
 }
 
-/* The chip's I/O supply: 1.8 V from LDO2 of the PM8350C ("ldoc2"). Nothing else is connected to it. */
+/*
+ * A rail of the chip, switched on through the always-on processor: NAME is the regulator's name in the command database
+ * ("ldoc2": PM8350C's LDO2), MV what to ask of it. Which rails the chip has, and through what, is the phone's (the
+ * selected row of the hardware table): the reference phone has its analog supply behind a GPIO instead, and calls
+ * avdd_supply_on() for it.
+ */
 static bool
-io_supply_on(void)
+ldo_on(const char *name, unsigned mv, const char *what)
 {
-	uint32_t base = rpmh_address("ldoc2");
+	uint32_t base = rpmh_address(name);
 	uint32_t address[3] = { base + VRM_VOLTAGE, base + VRM_ENABLE, base + VRM_MODE };
-	uint32_t data[3] = { 1800, 1, VRM_MODE_LDO_HPM };
+	uint32_t data[3] = { mv, 1, VRM_MODE_LDO_HPM };
 
 	/* addresses of regulators ("VRM") have 4 in bits 19:16; anything else is not what we are looking for */
 	if (base == 0 || (base >> 16 & 0xf) != 4) {
-		printf("goodix: RPMh: no regulator \"ldoc2\" (address %#x)\n", base);
+		printf("goodix: RPMh: no regulator \"%s\" (address %#x)\n", name, base);
 		return false;
 	}
-	printf("goodix: RPMh: ldoc2 is at %#x; slot status %#x, control %#x, irq enable %#x status %#x\n", base,
+	printf("goodix: RPMh: %s is at %#x; slot status %#x, control %#x, irq enable %#x status %#x\n", name, base,
 	    rd(TCS(TCS_STATUS)), rd(TCS(TCS_CONTROL)), rd(TCS(TCS_IRQ_ENABLE)), rd(TCS(TCS_IRQ_STATUS)));
 	if (!rpmh_write(address, data, 3)) {
 		return false;
 	}
-	printf("goodix: I/O supply on (1.8 V)\n");
+	printf("goodix: %s on (%u mV, %s)\n", what, mv, name);
 	return true;
+}
+
+/* The chip's I/O supply: 1.8 V from LDO2 of the PM8350C ("ldoc2") on the reference phone; the selected phone's rail. */
+static bool
+io_supply_on(void)
+{
+	if (hw->iovdd_ldo == LDO_NONE) {
+		printf("goodix: this phone has no I/O rail to switch (the table says so)\n");
+		return true;
+	}
+	return ldo_on(hw->iovdd_ldo, hw->iovdd_mv, "I/O supply");
 }
 
 /* ---- clocks (GCC) -------------------------------------------------------------------------------- */
@@ -274,20 +377,21 @@ io_supply_on(void)
 #define GCC_PHYS                0x00100000UL
 #define GCC_SIZE                0x60000UL
 #define GCC_VOTE                (gcc + 0x52008)         /* the application processor's votes */
-#define VOTE_QUP1_CORE_2X       (1u << 18)
-#define VOTE_QUP1_CORE          (1u << 19)
-#define VOTE_QUP1_M_AHB         (1u << 20)
-#define VOTE_QUP1_S_AHB         (1u << 21)
-#define VOTE_QUP1_SE5           (1u << 27)             /* serial engine 13 is the 6th of the second group */
-#define GCC_QUP1_M_AHB_CBCR     (gcc + 0x18004)         /* bit 31: the clock is off */
-#define GCC_QUP1_S_AHB_CBCR     (gcc + 0x18008)
-#define GCC_QUP1_SE5_CBCR       (gcc + 0x185fc)
-#define GCC_QUP1_SE5_CMD        (gcc + 0x18600)         /* bit 0: take the new configuration */
-#define GCC_QUP1_SE5_CFG        (gcc + 0x18604)         /* [4:0] 2*divider-1, [10:8] source, [13:12] mode */
-#define GCC_QUP1_SE5_DFSR       (gcc + 0x18614)         /* bit 0: the engine chooses among preset rates itself */
-#define GCC_QUP1_SE5_PERF_CFG(l) (gcc + 0x1861c + 4 * (l))
-#define GCC_QUP1_SE5_PERF_M(l)  (gcc + 0x1865c + 4 * (l))
-#define GCC_QUP1_SE5_PERF_N(l)  (gcc + 0x1869c + 4 * (l))
+/* the serial engine's votes in the application processor's vote register, and its registers (the selected phone's) */
+#define VOTE_QUP1_CORE_2X       (hw->vote_core_2x)
+#define VOTE_QUP1_CORE          (hw->vote_core)
+#define VOTE_QUP1_M_AHB         (hw->vote_m_ahb)
+#define VOTE_QUP1_S_AHB         (hw->vote_s_ahb)
+#define VOTE_QUP1_SE5           (hw->vote_se)
+#define GCC_QUP1_M_AHB_CBCR     (gcc + hw->m_ahb_cbcr)  /* bit 31: the clock is off */
+#define GCC_QUP1_S_AHB_CBCR     (gcc + hw->s_ahb_cbcr)
+#define GCC_QUP1_SE5_CBCR       (gcc + hw->se_cbcr)
+#define GCC_QUP1_SE5_CMD        (gcc + hw->se_cmd)      /* bit 0: take the new configuration */
+#define GCC_QUP1_SE5_CFG        (gcc + hw->se_cfg)      /* [4:0] 2*divider-1, [10:8] source, [13:12] mode */
+#define GCC_QUP1_SE5_DFSR       (gcc + hw->se_dfsr)     /* bit 0: the engine chooses among preset rates itself */
+#define GCC_QUP1_SE5_PERF_CFG(l) (gcc + hw->perf_cfg + 4 * (l))
+#define GCC_QUP1_SE5_PERF_M(l)  (gcc + hw->perf_m + 4 * (l))
+#define GCC_QUP1_SE5_PERF_N(l)  (gcc + hw->perf_n + 4 * (l))
 #define CLOCK_OFF               (1u << 31)
 #define XO_HZ                   19200000
 
@@ -360,7 +464,7 @@ clocks_on(void)
 
 /* ---- SPI through the serial engine (GENI) ---------------------------------------------------------- */
 
-#define SE_PHYS                 0x00a94000UL
+#define SE_PHYS                 (hw->se_phys)
 #define SE_SIZE                 0x4000UL
 #define GENI_FORCE_DEFAULT      (se + 0x020)
 #define GENI_OUTPUT_CTRL        (se + 0x024)
@@ -566,7 +670,8 @@ geni_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 
 /* ---- SPI by hand, on the same pins ----------------------------------------------------------------- */
 
-static unsigned bitbang_in = PIN_MISO, bitbang_out = PIN_MOSI;
+/* (which pins, and which way round, is decided at run time below, before the first use: the two data pins) */
+static unsigned bitbang_in, bitbang_out;
 
 static void
 bitbang_init(void)
@@ -1323,6 +1428,15 @@ static enum touch_chip touch_chip;
 static enum touch_chip
 touch_chip_detect(void)
 {
+	/* a board that straps nothing names its controller in the table instead (the Mi 11 Lite 5G's does) */
+	if (hw->chip_forced == 1) {
+		printf("goodix: the board does not strap which controller it has; the table says Goodix\n");
+		return TOUCH_GOODIX;
+	}
+	if (hw->chip_forced == 2) {
+		printf("goodix: the board does not strap which controller it has; the table says FocalTech\n");
+		return TOUCH_FOCALTECH;
+	}
 	gpio_configure(PIN_FOCALTECH_ID, 0, PULL_NONE, 2, false);
 	gpio_configure(PIN_GOODIX_ID, 0, PULL_NONE, 2, false);
 	if (gpio_get(PIN_GOODIX_ID) && !gpio_get(PIN_FOCALTECH_ID)) {
@@ -1357,14 +1471,39 @@ static void
 show_state(const char *when)
 {
 	printf("goodix: %s: votes %#x, clocks %#x %#x %#x, rate cfg %#x dfs %#x; pins cs/clk/mosi/miso cfg %#x %#x %#x %#x,"
-	    " reset %#x/%u, int %#x/%u, avdd %#x/%u, straps %u %u\n", when, rd(GCC_VOTE), rd(GCC_QUP1_M_AHB_CBCR),
-	    rd(GCC_QUP1_S_AHB_CBCR), rd(GCC_QUP1_SE5_CBCR), rd(GCC_QUP1_SE5_CFG), rd(GCC_QUP1_SE5_DFSR), rd(GPIO_CFG(PIN_CS)),
-	    rd(GPIO_CFG(PIN_CLK)), rd(GPIO_CFG(PIN_MOSI)), rd(GPIO_CFG(PIN_MISO)), rd(GPIO_CFG(PIN_RESET)),
-	    rd(GPIO_IO(PIN_RESET)), rd(GPIO_CFG(PIN_INT)), rd(GPIO_IO(PIN_INT)), rd(GPIO_CFG(PIN_AVDD)), rd(GPIO_IO(PIN_AVDD)),
-	    gpio_get(68), gpio_get(96));
+	    " reset %#x/%u, int %#x/%u", when, rd(GCC_VOTE), rd(GCC_QUP1_M_AHB_CBCR), rd(GCC_QUP1_S_AHB_CBCR),
+	    rd(GCC_QUP1_SE5_CBCR), rd(GCC_QUP1_SE5_CFG), rd(GCC_QUP1_SE5_DFSR), rd(GPIO_CFG(PIN_CS)), rd(GPIO_CFG(PIN_CLK)),
+	    rd(GPIO_CFG(PIN_MOSI)), rd(GPIO_CFG(PIN_MISO)), rd(GPIO_CFG(PIN_RESET)), rd(GPIO_IO(PIN_RESET)),
+	    rd(GPIO_CFG(PIN_INT)), rd(GPIO_IO(PIN_INT)));
+	/* a phone whose analog supply is a regulator, or that straps nothing, has no register at those pins to read */
+	if (hw->pin_avdd != PIN_NONE) {
+		printf(", avdd %#x/%u", rd(GPIO_CFG(PIN_AVDD)), rd(GPIO_IO(PIN_AVDD)));
+	}
+	if (hw->pin_goodix_id != PIN_NONE) {
+		printf(", straps %u %u", gpio_get(hw->pin_focaltech_id), gpio_get(hw->pin_goodix_id));
+	}
+	printf("\n");
 }
 
-/* Power the chip up from nothing, in the vendor driver's order. False if the I/O supply could not be switched on. */
+/*
+ * The chip's analog supply: a GPIO that switches it on the reference phone, a regulator of its own (PM8350C's LDO7 at
+ * 3.0 V on the Mi 11 Lite 5G) when the table says the phone has no such GPIO.
+ */
+static bool
+avdd_supply_on(void)
+{
+	if (hw->pin_avdd != PIN_NONE) {
+		gpio_output(PIN_AVDD, true, PULL_NONE, 2);
+		return true;
+	}
+	if (hw->avdd_ldo == LDO_NONE) {
+		printf("goodix: this phone has no analog rail (the table says so)\n");
+		return true;
+	}
+	return ldo_on(hw->avdd_ldo, hw->avdd_mv, "analog supply");
+}
+
+/* Power the chip up from nothing, in the vendor driver's order. False if a supply could not be switched on. */
 static bool
 power_on(void)
 {
@@ -1375,7 +1514,9 @@ power_on(void)
 		return false;
 	}
 	sleep_ms(3);
-	gpio_output(PIN_AVDD, true, PULL_NONE, 2);
+	if (!avdd_supply_on()) {
+		return false;
+	}
 	sleep_ms(15);
 	return true;
 }
@@ -1475,6 +1616,26 @@ chip_touching(void)
 	return false;
 }
 
+/*
+ * Which phone's numbers to use: boot-arg hakios_device=<name>, the same argument and the same values the XNU loader reads
+ * to name its platform (xnuloader/loader.c). A name the table does not know, or none at all, leaves the reference phone's
+ * row in place -- what this driver used to be fixed to.
+ */
+static void
+hw_select(void)
+{
+	char want[32];
+
+	hw = &hw_redwood;
+	if (!PE_parse_boot_argn("hakios_device", want, sizeof(want))) {
+		return;
+	}
+	if (strcmp(want, "renoir") == 0) {
+		hw = &hw_renoir;
+	}
+	printf("goodix: the phone says it is \"%s\"; using %s's pins, bus and supplies\n", want, hw->device);
+}
+
 static void
 goodix_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -1557,6 +1718,7 @@ hakios_goodix_init(void)
 	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
+	hw_select();
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
 	if (kernel_thread_start(goodix_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
