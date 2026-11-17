@@ -117,6 +117,15 @@ struct touch_hw {
 	 */
 	int chip_forced;
 
+	/*
+	 * The FocalTech chip's own answer to "which chip are you": two bytes read at the chip-ID registers, and whether the
+	 * firmware that comes with this driver (an FT3680's) may be downloaded when the chip does not answer with them. A
+	 * phone whose controller is another chip of the family -- the Mi 11 Lite 5G's is an FT3658U -- has its own bytes and
+	 * says no: the wrong firmware in the wrong chip is not worth the risk, and those chips keep theirs in their own flash.
+	 */
+	uint8_t ft_id_h, ft_id_l;
+	int ft_fw_download;
+
 	/* the regulators, by their names in the RPMh command database, and the millivolts to ask of each */
 	const char *iovdd_ldo;
 	unsigned iovdd_mv;
@@ -135,6 +144,7 @@ static const struct touch_hw hw_redwood = {
 	.se_phys = 0x00a94000UL,
 	.pin_int = 81, .pin_reset = 105, .pin_avdd = 107,
 	.pin_focaltech_id = 68, .pin_goodix_id = 96, .chip_forced = 0,
+	.ft_id_h = 0x56, .ft_id_l = 0x62, .ft_fw_download = 1,
 	.iovdd_ldo = "ldoc2", .iovdd_mv = 1800, .avdd_ldo = LDO_NONE, .avdd_mv = 0,
 	.m_ahb_cbcr = 0x18004, .s_ahb_cbcr = 0x18008, .se_cbcr = 0x185fc, .se_cmd = 0x18600,
 	.se_cfg = 0x18604, .se_dfsr = 0x18614, .perf_cfg = 0x1861c, .perf_m = 0x1865c, .perf_n = 0x1869c,
@@ -158,6 +168,7 @@ static const struct touch_hw hw_renoir = {
 	.se_phys = 0x00988000UL,
 	.pin_int = 31, .pin_reset = 30, .pin_avdd = PIN_NONE,
 	.pin_focaltech_id = PIN_NONE, .pin_goodix_id = PIN_NONE, .chip_forced = 2,   /* FocalTech: see above */
+	.ft_id_h = 0x36, .ft_id_l = 0x40, .ft_fw_download = 0,
 	.iovdd_ldo = "ldoc2", .iovdd_mv = 1620, .avdd_ldo = "ldoc7", .avdd_mv = 3000,
 	.m_ahb_cbcr = 0x17004, .s_ahb_cbcr = 0x17008, .se_cbcr = 0x1726c, .se_cmd = 0x17270,
 	.se_cfg = 0x17274, .se_dfsr = 0x17284, .perf_cfg = 0x1728c, .perf_m = 0x172cc, .perf_n = 0x1730c,
@@ -1173,8 +1184,8 @@ focaltech_wait_valid(uint8_t *high, uint8_t *low)
 	for (int attempt = 0; attempt < 5; attempt++) {
 		if (focaltech_read(FOCALTECH_CHIP_ID_H, high, 1) &&
 		    focaltech_read(FOCALTECH_CHIP_ID_L, low, 1) &&
-		    *high == 0x56 && *low == 0x62) {
-			printf("focaltech: FT3680 runtime ID valid after %d attempt(s)\n", attempt + 1);
+		    *high == hw->ft_id_h && *low == hw->ft_id_l) {
+			printf("focaltech: runtime ID %02x %02x valid after %d attempt(s)\n", *high, *low, attempt + 1);
 			return true;
 		}
 		sleep_ms(200);			/* vendor INTERVAL_READ_REG */
@@ -1198,11 +1209,12 @@ focaltech_enter_boot_rom(void)
 		gpio_set(PIN_RESET, true);
 		sleep_ms(FTS_CMD_START_DELAY + cnt * 8);
 		if (focaltech_read_boot_id(&boot_high, &boot_low) &&
-		    boot_high == 0x56 && boot_low == 0x62) {
+		    boot_high == hw->ft_id_h && boot_low == hw->ft_id_l) {
 			printf("focaltech: in boot ROM after reset %d\n", cnt);
 			return true;
 		}
-		printf("focaltech: boot ID attempt %d: %02x %02x (not 56 62)\n", cnt, boot_high, boot_low);
+		printf("focaltech: boot ID attempt %d: %02x %02x (not %02x %02x)\n", cnt, boot_high, boot_low,
+		    hw->ft_id_h, hw->ft_id_l);
 	}
 	return false;
 }
@@ -1259,13 +1271,24 @@ focaltech_probe(bool verbose)
 		return true;
 	}
 
+	/*
+	 * The firmware this driver carries is an FT3680's; this phone's chip is another of the family (an FT3658U), and the
+	 * wrong firmware written to the wrong chip is not a thing to try. Those chips keep their firmware in their own flash
+	 * and come up with it, so the download is only needed when one did not -- and then it must be that chip's own, which
+	 * this is not. Asked before the chip is reset (focaltech_enter_boot_rom() resets it), so that a phone whose chip did
+	 * not answer is left as it was found.
+	 */
+	if (!hw->ft_fw_download) {
+		printf("focaltech: the chip does not answer with %02x %02x, and the firmware here is an FT3680's, not this phone's; "
+		    "the chip is left alone (it keeps its own in flash)\n", hw->ft_id_h, hw->ft_id_l);
+		return false;
+	}
 	if (!focaltech_enter_boot_rom()) {
 		if (verbose) {
 			printf("focaltech: chip not in boot ROM; last read runtime %02x %02x\n", high, low);
 		}
 		return false;
 	}
-
 	printf("focaltech: downloading %u bytes of firmware to PRAM...\n", FOCALTECH_FW_LENGTH);
 	if (!focaltech_write_pram(focaltech_fw, FOCALTECH_FW_LENGTH)) {
 		printf("focaltech: PRAM download failed\n");
@@ -1543,8 +1566,12 @@ bring_up(void)
 
 	show_state("as found");
 	touch_chip = touch_chip_detect();
-	printf("goodix: ID gpio96=%u gpio68=%u: selected %s\n", gpio_get(PIN_GOODIX_ID),
-	    gpio_get(PIN_FOCALTECH_ID), chip_name());
+	if (hw->pin_goodix_id != PIN_NONE) {
+		printf("goodix: ID gpio%u=%u gpio%u=%u: selected %s\n", hw->pin_goodix_id, gpio_get(hw->pin_goodix_id),
+		    hw->pin_focaltech_id, gpio_get(hw->pin_focaltech_id), chip_name());
+	} else {
+		printf("goodix: selected %s (the table says so; this board has no strap pins)\n", chip_name());
+	}
 	if (!power_on()) {
 		printf("goodix: the I/O supply is not on; the chip is left alone\n");
 		return false;
