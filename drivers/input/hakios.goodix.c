@@ -118,6 +118,12 @@ struct touch_hw {
 	int chip_forced;
 
 	/*
+	 * Set when the serial engine does not carry this chip and the four pins have to be driven by hand. The pins are
+	 * the four the row lists, in the order they are used for data in, data out, clock and chip select.
+	 */
+	int bitbang_only;
+
+	/*
 	 * The FocalTech chip's own answer to "which chip are you": two bytes read at the chip-ID registers, and whether the
 	 * firmware that comes with this driver (an FT3680's) may be downloaded when the chip does not answer with them. A
 	 * phone whose controller is another chip of the family -- the Mi 11 Lite 5G's is an FT3658U -- has its own bytes and
@@ -143,7 +149,7 @@ static const struct touch_hw hw_redwood = {
 	.pin_miso = 52, .pin_mosi = 53, .pin_clk = 54, .pin_cs = 55,
 	.se_phys = 0x00a94000UL,
 	.pin_int = 81, .pin_reset = 105, .pin_avdd = 107,
-	.pin_focaltech_id = 68, .pin_goodix_id = 96, .chip_forced = 0,
+	.pin_focaltech_id = 68, .pin_goodix_id = 96, .chip_forced = 0, .bitbang_only = 0,
 	.ft_id_h = 0x56, .ft_id_l = 0x62, .ft_fw_download = 1,
 	.iovdd_ldo = "ldoc2", .iovdd_mv = 1800, .avdd_ldo = LDO_NONE, .avdd_mv = 0,
 	.m_ahb_cbcr = 0x18004, .s_ahb_cbcr = 0x18008, .se_cbcr = 0x185fc, .se_cmd = 0x18600,
@@ -168,8 +174,24 @@ static const struct touch_hw hw_renoir = {
 	.se_phys = 0x00988000UL,
 	.pin_int = 31, .pin_reset = 30, .pin_avdd = PIN_NONE,
 	.pin_focaltech_id = PIN_NONE, .pin_goodix_id = PIN_NONE, .chip_forced = 2,   /* FocalTech: see above */
-	.ft_id_h = 0x36, .ft_id_l = 0x40, .ft_fw_download = 0,
-	.iovdd_ldo = "ldoc2", .iovdd_mv = 1620, .avdd_ldo = "ldoc7", .avdd_mv = 3000,
+	/*
+	 * The serial engine does not carry this chip: its FIFO reads back what was written to the output pin instead of
+	 * what the chip drove, on every transfer, while the same four pins driven by hand answer at once (the chip ID
+	 * 56 52, then reports). So the pins are used directly, in the order the row lists them.
+	 */
+	.bitbang_only = 1,
+	/*
+	 * Answers 0x5652 -- "verify id:0x5652", "get ic information, chip id = 0x5652", read out of this phone's own
+	 * fts_ts driver in its Android (dmesg). The registers the driver reads carry the two halves: 0x56 at 0xa3,
+	 * 0x52 at 0x9f.
+	 */
+	.ft_id_h = 0x56, .ft_id_l = 0x52, .ft_fw_download = 0,
+	/*
+	 * L2C and L7C as this phone's Android leaves them: pm8350c_l2 = 1.8 V, pm8350c_l7 = 3.3 V, both enabled, one
+	 * user each (the microvolts file of each regulator in /sys/class/regulator). The device tree's 3.0 V for L7C is
+	 * its boot value, not the one the touch runs at.
+	 */
+	.iovdd_ldo = "ldoc2", .iovdd_mv = 1800, .avdd_ldo = "ldoc7", .avdd_mv = 3300,
 	.m_ahb_cbcr = 0x17004, .s_ahb_cbcr = 0x17008, .se_cbcr = 0x1726c, .se_cmd = 0x17270,
 	.se_cfg = 0x17274, .se_dfsr = 0x17284, .perf_cfg = 0x1728c, .perf_m = 0x172cc, .perf_n = 0x1730c,
 	.vote_core_2x = 1u << 9, .vote_core = 1u << 8, .vote_m_ahb = 1u << 6, .vote_s_ahb = 1u << 7,
@@ -386,7 +408,7 @@ io_supply_on(void)
 /* ---- clocks (GCC) -------------------------------------------------------------------------------- */
 
 #define GCC_PHYS                0x00100000UL
-#define GCC_SIZE                0x60000UL
+#define GCC_SIZE                0x200000UL      /* the GCC block is 0x1f0000 (the phone's /soc/clock-controller@100000); 0x60000 reached only 0x160000, short of QUP1's SE registers at 0x17xxx-0x18xxx */
 #define GCC_VOTE                (gcc + 0x52008)         /* the application processor's votes */
 /* the serial engine's votes in the application processor's vote register, and its registers (the selected phone's) */
 #define VOTE_QUP1_CORE_2X       (hw->vote_core_2x)
@@ -463,7 +485,13 @@ clocks_on(void)
 	}
 	wr(GCC_VOTE, rd(GCC_VOTE) | VOTE_QUP1_SE5);
 	for (int i = 0; i < 1000; i++) {
-		if (!((rd(GCC_QUP1_M_AHB_CBCR) | rd(GCC_QUP1_S_AHB_CBCR) | rd(GCC_QUP1_SE5_CBCR)) & CLOCK_OFF)) {
+		/*
+		 * A CBCR bit 31 that is set says the branch is halted; bit 1 says the branch is under hardware's control
+		 * (hwcg_reg/hwcg_bit in the clock controller's own table: the QUP0 AHB branches have it, the QUP1 ones do
+		 * not), and such a branch reads halted whether or not anything is wrong with it. What the engine needs is
+		 * its own clock, so that one is what is waited for.
+		 */
+		if (!(rd(GCC_QUP1_SE5_CBCR) & CLOCK_OFF)) {
 			return true;
 		}
 		sleep_us(10);
@@ -538,8 +566,15 @@ geni_spi_init(uint32_t hz)
 	if ((rd(GENI_FW_REVISION_RO) >> 8 & 0xff) != 1) {
 		return "the serial engine has no SPI firmware";
 	}
+	/*
+	 * GENI_IF_DISABLE_RO says whether the firmware's own configuration enables the FIFO interface, and it is a status
+	 * bit, not a gate: the vendor's spi-geni-qcom.c never looks at it and drives the FIFO either way (it reads the
+	 * depth and calls geni_se_init). The reference phone's reads 0 and this one's reads 1, so testing it here refused a
+	 * bus that works -- said, and gone on with, as the vendor does.
+	 */
 	if (rd(GENI_IF_DISABLE_RO) & 1) {
-		return "the serial engine's FIFO interface is disabled";
+		printf("goodix: the serial engine's FIFO interface reads disabled (%#x); driving the FIFO anyway\n",
+		    rd(GENI_IF_DISABLE_RO));
 	}
 	fifo_depth = rd(SE_HW_PARAM_0) >> 16 & 0x3f;
 	if (fifo_depth < 4) {
@@ -682,13 +717,13 @@ geni_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 /* ---- SPI by hand, on the same pins ----------------------------------------------------------------- */
 
 /* (which pins, and which way round, is decided at run time below, before the first use: the two data pins) */
-static unsigned bitbang_in, bitbang_out;
+static unsigned bitbang_in, bitbang_out, bitbang_clock, bitbang_cs;
 
 static void
 bitbang_init(void)
 {
-	gpio_output(PIN_CS, true, PULL_NONE, 6);
-	gpio_output(PIN_CLK, false, PULL_NONE, 6);
+	gpio_output(bitbang_cs, true, PULL_NONE, 6);
+	gpio_output(bitbang_clock, false, PULL_NONE, 6);
 	gpio_output(bitbang_out, false, PULL_NONE, 6);
 	gpio_configure(bitbang_in, 0, PULL_NONE, 2, false);
 }
@@ -696,21 +731,21 @@ bitbang_init(void)
 static bool
 bitbang_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 {
-	gpio_set(PIN_CS, false);
+	gpio_set(bitbang_cs, false);
 	for (uint32_t i = 0; i < length; i++) {
 		uint8_t out = tx ? tx[i] : 0, in = 0;
 
 		for (int bit = 7; bit >= 0; bit--) {
 			gpio_set(bitbang_out, out >> bit & 1);
-			gpio_set(PIN_CLK, true);
+			gpio_set(bitbang_clock, true);
 			in = (uint8_t)(in << 1 | gpio_get(bitbang_in));
-			gpio_set(PIN_CLK, false);
+			gpio_set(bitbang_clock, false);
 		}
 		if (rx) {
 			rx[i] = in;
 		}
 	}
-	gpio_set(PIN_CS, true);
+	gpio_set(bitbang_cs, true);
 	return true;
 }
 
@@ -1041,6 +1076,18 @@ goodix_poll(void)
 #define FOCALTECH_MAX_TRANSFER      (7 + FOCALTECH_TOUCH_REPORT_LEN + 2)
 
 static uint8_t focaltech_tx[FOCALTECH_MAX_TRANSFER], focaltech_rx[FOCALTECH_MAX_TRANSFER];
+static int focaltech_diagnose = 6;      /* how many failed reads still say why (the first ones say it all) */
+static int focaltech_diagnose_report = 6;   /* ... and the same for the touch report, which is read all the time */
+
+/* The touch report is read on every poll, so it gets its own quota: the chip-ID reads would otherwise use it up. */
+static int
+focaltech_diagnose_ok(uint8_t address)
+{
+	if (address == FOCALTECH_TOUCH_DATA) {
+		return focaltech_diagnose_report > 0 && focaltech_diagnose_report-- > 0;
+	}
+	return focaltech_diagnose > 0 && focaltech_diagnose-- > 0;
+}
 
 /* CRC-16/Kermit (polynomial 0x8408 reflected, initial 0xffff) -- same as vendor rckit_crc16(). */
 static uint16_t
@@ -1074,6 +1121,9 @@ focaltech_read(uint8_t address, uint8_t *data, uint32_t length)
 		focaltech_tx[2] = (uint8_t)(length >> 8);
 		focaltech_tx[3] = (uint8_t)length;
 		if (!spi_transfer(focaltech_tx, focaltech_rx, transfer_length)) {
+			if (focaltech_diagnose_ok(address)) {
+				printf("focaltech: reg %#x read of %u: the bus did not carry it\n", address, length);
+			}
 			sleep_us(150);
 			continue;
 		}
@@ -1087,6 +1137,17 @@ focaltech_read(uint8_t address, uint8_t *data, uint32_t length)
 				sleep_us(150);		/* minimum CS-high time in the vendor driver */
 				return true;
 			}
+			if (focaltech_diagnose_ok(address) ) {
+				printf("focaltech: reg %#x read of %u: checksum %04x, the chip said %04x; first bytes"
+				    " %02x %02x %02x %02x %02x %02x %02x %02x\n", address, length, expected, received,
+				    focaltech_rx[0], focaltech_rx[1], focaltech_rx[2], focaltech_rx[3], focaltech_rx[4],
+				    focaltech_rx[5], focaltech_rx[6], focaltech_rx[7]);
+			}
+		} else if (focaltech_diagnose_ok(address)) {
+			printf("focaltech: reg %#x read of %u: status %02x (busy or checksum error); first bytes"
+			    " %02x %02x %02x %02x %02x %02x %02x %02x\n", address, length, focaltech_rx[3],
+			    focaltech_rx[0], focaltech_rx[1], focaltech_rx[2], focaltech_rx[3], focaltech_rx[4],
+			    focaltech_rx[5], focaltech_rx[6], focaltech_rx[7]);
 		}
 		sleep_us(150);
 	}
@@ -1387,7 +1448,12 @@ focaltech_contact_update(uint32_t id, uint32_t event, uint32_t x, uint32_t y,
 }
 
 /* Panel size in the FT3680 super-high-resolution reports (device tree x_max/y_max on redwood). */
-static uint32_t focaltech_max_x = 10800, focaltech_max_y = 24000;
+/*
+ * The panel, in the units the chip reports in. The Mi 11 Lite 5G's controller reports pixels -- its own driver says
+ * "Resolution:(0,0)~(1080,2400)" and uses the two bytes of a coordinate as they come -- where the reference phone's
+ * FT3680 reports in tenths of a pixel (10800 x 24000, its device tree's goodix,panel-max-x).
+ */
+static uint32_t focaltech_max_x = 1080, focaltech_max_y = 2400;
 
 static void
 focaltech_report(const uint8_t *report)
@@ -1405,11 +1471,15 @@ focaltech_report(const uint8_t *report)
 		if (id >= FOCALTECH_MAX_TOUCHES) {
 			break;			/* no more valid slots in this report */
 		}
+		/*
+		 * The Mi 11 Lite 5G's controller (an FT3658U) reports each coordinate as twelve bits in two bytes, high
+		 * nibble first -- the vendor's focaltech_3658u/focaltech_core.c: ((buf[X_H] & 0x0F) << 8) + buf[X_L] --
+		 * where the reference phone's FT3680 spreads it over fifteen bits and three bytes. Read the FT3680 way, a
+		 * Y came out as 39115 on a 2400-line panel.
+		 */
 		event = (touch[0] >> 6) & 0x3;
-		x = ((uint32_t)(touch[0] & 0x0f) << 11) | ((uint32_t)touch[1] << 3) |
-		    ((uint32_t)touch[4] >> 5);
-		y = ((uint32_t)(touch[2] & 0x0f) << 11) | ((uint32_t)touch[3] << 3) |
-		    (((uint32_t)touch[4] & 0x1c) >> 2);
+		x = ((uint32_t)(touch[0] & 0x0f) << 8) | (uint32_t)touch[1];
+		y = ((uint32_t)(touch[2] & 0x0f) << 8) | (uint32_t)touch[3];
 		focaltech_contact_update(id, event, x, y, focaltech_max_x, focaltech_max_y);
 	}
 	(void)count;
@@ -1541,6 +1611,15 @@ power_on(void)
 		return false;
 	}
 	sleep_ms(15);
+	/*
+	 * Out of reset, and left out: a chip held in reset answers nothing, and this driver used to be released only by
+	 * focaltech_enter_boot_rom(), which resets it again for a firmware download it may now refuse (a phone whose
+	 * firmware is not this driver's). The chip that keeps its firmware in its own flash needs exactly this: the reset
+	 * pulse and the time to come up running it.
+	 */
+	gpio_set(PIN_RESET, true);
+	/* a FocalTech answers when its firmware is running, which is not immediately after the line goes high */
+	sleep_ms(300);
 	return true;
 }
 
@@ -1580,12 +1659,16 @@ bring_up(void)
 	if (clocks_on()) {
 		printf("goodix: serial engine: firmware %#x, interface %#x, parameters %#x, source clock %u Hz (select %u)\n",
 		    rd(GENI_FW_REVISION_RO), rd(GENI_IF_DISABLE_RO), rd(SE_HW_PARAM_0), se_source_hz, se_clock_select);
-		uint32_t spi_hz = 1000000;
+		uint32_t spi_hz = 6000000;
 
-		/* boot-arg touch_spi_hz=N: the bus at N Hz (Android's device tree gives the chip 5 MHz) */
+		/*
+		 * boot-arg touch_spi_hz=N: the bus at N Hz. The Mi 11 Lite 5G's device tree gives this chip 6 MHz and its
+		 * own driver reports "BUS:SPI,mode:0,max_freq:12000000" (ft_driver_info in sysfs), so 6 MHz is the value
+		 * this phone runs at; the reference phone's is 5 MHz.
+		 */
 		PE_parse_boot_argn("touch_spi_hz", &spi_hz, sizeof(spi_hz));
-		if (spi_hz < 100000 || spi_hz > 10000000) {
-			spi_hz = 1000000;
+		if (spi_hz < 100000 || spi_hz > 12000000) {
+			spi_hz = 6000000;
 		}
 		printf("goodix: the bus at %u Hz\n", spi_hz);
 		problem = geni_spi_init(spi_hz);
@@ -1602,15 +1685,58 @@ bring_up(void)
 		printf("goodix: %s; driving the pins by hand\n", problem);
 	}
 
-	/* by hand; which of the two data pins is the input is not written down anywhere, so try both */
+	/*
+	 * By hand. Which of the four pins is which is not written down: the phone's device tree lists them (gpio20-23,
+	 * function qup10) without saying which is data in, and reading one that the chip does not drive returns the byte
+	 * just written to the output pin -- the echo that says the pin is the wrong one. So every assignment is tried:
+	 * a pair of pins for the data (the other way round in the second pass), the clock and the chip select taken from
+	 * what is left.
+	 */
 	spi_transfer = bitbang_transfer;
-	for (int attempt = 0; attempt < 2; attempt++) {
-		bitbang_in = attempt == 0 ? PIN_MISO : PIN_MOSI;
-		bitbang_out = attempt == 0 ? PIN_MOSI : PIN_MISO;
+	if (hw->bitbang_only) {
+		/* this phone's row says the four pins in the order they are used: data in, data out, clock, select */
+		bitbang_in = PIN_MISO;
+		bitbang_out = PIN_MOSI;
+		bitbang_clock = PIN_CLK;
+		bitbang_cs = PIN_CS;
 		bitbang_init();
 		if (chip_probe(true)) {
-			printf("goodix: %s answers on pins driven by hand (data in on gpio%u)\n", chip_name(), bitbang_in);
+			printf("goodix: %s answers on the four pins driven by hand (in gpio%u, out gpio%u, clock gpio%u, "
+			    "select gpio%u)\n", chip_name(), bitbang_in, bitbang_out, bitbang_clock, bitbang_cs);
 			return true;
+		}
+		show_state("no answer");
+		return false;
+	}
+	{
+		const unsigned pin[4] = { PIN_MISO, PIN_MOSI, PIN_CLK, PIN_CS };   /* the table's four, in its order */
+
+		for (int in = 0; in < 4; in++) {
+			for (int out = 0; out < 4; out++) {
+				if (out == in) {
+					continue;
+				}
+				int clk = -1, cs = -1;
+				for (int k = 0; k < 4; k++) {
+					if (k != in && k != out) {
+						if (clk < 0) {
+							clk = k;
+						} else {
+							cs = k;
+						}
+					}
+				}
+				bitbang_in = pin[in];
+				bitbang_out = pin[out];
+				bitbang_clock = pin[clk];
+				bitbang_cs = pin[cs];
+				bitbang_init();
+				if (chip_probe(false)) {
+					printf("goodix: %s answers on pins driven by hand: in gpio%u, out gpio%u, clock gpio%u, "
+					    "select gpio%u\n", chip_name(), bitbang_in, bitbang_out, bitbang_clock, bitbang_cs);
+					return true;
+				}
+			}
 		}
 	}
 	show_state("no answer");
