@@ -69,8 +69,9 @@
  *   adreno_keep=1      with adreno=21: the GPU is not stopped again but kept for the system to draw
  *                      with, through the service HakiosGPU (see "the GPU kept on" below); it is
  *                      given back when the run ends (adreno_dirty=1: left as a panic leaves it)
- *   adreno_speed=N     step 17 asks the GMU for the 3D core's Nth speed: 1 315 MHz, 2 450 MHz,
- *                      3 550 MHz (the default: the most this phone's GPU is rated for)
+ *   adreno_speed=N     step 17 asks the GMU for row N of the phone's own speed table (struct
+ *                      gpu_hw below; on the reference phone 1 315 MHz, 2 450 MHz, 3 550 MHz, the
+ *                      last being the default; on renoir 1 285 MHz up to 8 747 MHz, 1 the default)
  *   adreno_blind=1     step 20 starts the command processor with its microcode nowhere, and
  *   adreno_stream1=N   step 18 leaves the core's second stream out (0) or gives it an empty
  *                      context of its own (2): what the SMMU then records shows what the core
@@ -1911,6 +1912,91 @@ step_gmu_firmware(void)
 	return true;
 }
 
+/* ---- the phone's own numbers: which GPU the firmware is told this is, and the speeds of the 3D core -------- */
+
+/*
+ * Two things the GMU's firmware is handed from the device tree, and neither is the same on every phone.
+ *
+ * The chip id goes to the firmware before its processor is let out of reset (vendor's a6xx_gmu_register_config: the
+ * device tree's qcom,chipid with the minor version moved to bits 15:12 and the patch to 11:8). The firmware keeps a
+ * table of the chips it knows -- in a660_gmu.bin at 0xb02c, each compared against chipid >> 8: 0x00060305, 0x00060600,
+ * 0x00060900 -- and drives the 3D core's power one way or another depending on which it matches. renoir's qcom,chipid
+ * is 0x06060010, which is 0x06060000 the way the firmware wants it: its a660 entry.
+ *
+ * The speeds and the supply level each needs are qcom,gpu-pwrlevels of the phone's speed bin, lowest first, with the
+ * row of nothing in front that the vendor's setup_gx_arc_votes() puts there (adreno_a6xx_rpmh.c). The level numbers are
+ * RPMH's (dt-bindings/regulator/qcom,rpmh-regulator-levels.h: LOW_SVS 64, LOW_SVS_L1 80, SVS 128, SVS_L0 144, SVS_L1
+ * 192, SVS_L2 224, NOM 256, NOM_L1 320). Both of these were the reference phone's on renoir at first, and with them the
+ * GMU accepted every message of step 17 and then never powered the core: sptprac_pwr_clk_status stayed at 0xc0 (GX
+ * switch off, GX clock off) and gmu2host_intr_info at 0, with no answer to "slumber" after it. With the phone's own two
+ * values the switch comes on (0x0), the OOB request is granted, and steps 18 to 22 run: the zap shader authenticated by
+ * TrustZone, the command processor started, the core out of secure mode, and a frame drawn into memory and put on the
+ * panel.
+ */
+struct gpu_hw {
+	const char *device;
+
+	/* what the GMU's firmware is told this GPU is */
+	uint32_t chip;
+
+	/* the 3D core's speeds, lowest first, row 0 being "off" */
+	struct {
+		uint32_t khz, level;
+	} speeds[9];
+	unsigned speeds_count;
+
+	/* which row step 17 asks for first (the vendor starts at the lowest; boot-arg adreno_speed=N moves it) */
+	unsigned speed_wanted;
+};
+
+static const struct gpu_hw hw_redwood = {
+	.device = "redwood",
+	.chip = 0x06035000,                     /* dt qcom,chipid 0x06030500 the way the firmware wants it */
+	.speeds = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } },
+	.speeds_count = 4,
+	.speed_wanted = 3,
+};
+
+/* dt: qcom,gpu-pwrlevels-0 (speed bin 0, the phone's: qcom,initial-pwrlevel = 7) */
+static const struct gpu_hw hw_renoir = {
+	.device = "renoir",
+	.chip = 0x06060000,                     /* dt qcom,chipid 0x06060010; the firmware's a660 entry is 0x00060600 */
+	.speeds = {
+		{ 0, 0 },
+		{ 285000, 64 },                 /* qcom,gpu-pwrlevel@7: LOW_SVS */
+		{ 365000, 80 },                 /* @6: LOW_SVS_L1 */
+		{ 443000, 128 },                /* @5: SVS */
+		{ 490000, 144 },                /* @4: SVS_L0 */
+		{ 540000, 192 },                /* @3: SVS_L1 */
+		{ 608000, 224 },                /* @2: SVS_L2 */
+		{ 676000, 256 },                /* @1: NOM */
+		{ 747000, 320 },                /* @0: NOM_L1 */
+	},
+	.speeds_count = 9,
+	.speed_wanted = 1,                      /* the vendor's default level: the lowest */
+};
+
+static const struct gpu_hw *hw = &hw_redwood;
+
+/* Which phone's numbers to use: boot-arg hakios_device=<name>, as the touch driver reads it (see hw_select there). */
+static void
+hw_select(void)
+{
+	char want[32];
+
+	hw = &hw_redwood;
+	if (!PE_parse_boot_argn("hakios_device", want, sizeof(want))) {
+		return;
+	}
+	if (strcmp(want, "renoir") == 0) {
+		hw = &hw_renoir;
+		return;
+	}
+	if (strcmp(want, "redwood") != 0) {
+		printf("adreno: the device named \"%s\" is not known here: using the reference phone's numbers\n", want);
+	}
+}
+
 /* ---- step 15: start the GMU ---------------------------------------------------------------------------- */
 
 #define GMU_ICACHE_CONFIG       GMU_WORD(0x4c00)
@@ -1930,10 +2016,11 @@ step_gmu_firmware(void)
 #define GMU_GMU2HOST_INTR_CLR   GMU_WORD(0x5191)
 #define GMU_GMU2HOST_INTR_INFO  GMU_WORD(0x5192)        /* bit 0: a message for us; bit 31: the 3D core is ours */
 #define GMU_HOST2GMU_INTR_SET   GMU_WORD(0x5194)        /* bit 0: a message for the GMU; bit 30, 31: see step 17 */
+#define GMU_GX_SPTPRAC_POWER_CONTROL GMU_WORD(0x0081)   /* the 3D core's power, asked for by us on a630 only */
+#define GMU_CPR_FSM_CTL         0x00030004              /* dt: gpu_cpr_fsm_ctl, in the clock controller's range */
 #define GMU_RSCC_CONTROL_REQ    GMU_WORD(0x9307)
 #define GMU_AO_AHB_FENCE_CTRL   GMU_WORD(0x9310)
 #define GMU_AHB_FENCE_RANGE_0   GMU_WORD(0x9311)
-#define GMU_CHIP                0x06035000      /* dt qcom,chipid 0x06030500 the way the firmware wants it */
 #define GMU_STARTED_MASK        0x1ff           /* of fw_init_result, for firmware newer than core 0x20010004 */
 #define GMU_STARTED             0x100
 #define GMU_FAILED              0xe00
@@ -2015,7 +2102,7 @@ step_gmu_start(void)
 	put(&gmu, "cm3_cfg", GMU_CM3_CFG, 0x4052);
 	put(&gbif, "halt", GBIF_HALT, 0);
 	put(&gmu, "pwr_col_cp_resp", GMU_PWR_COL_CP_RESP, 0);
-	put(&gmu, "hfi_sfr_addr", GMU_HFI_SFR_ADDR, GMU_CHIP);
+	put(&gmu, "hfi_sfr_addr", GMU_HFI_SFR_ADDR, hw->chip);
 	put(&gmu, "pwr_col_cp_msg", GMU_PWR_COL_CP_MSG, GMU_LOG_ADDRESS | (GMU_LOG_SIZE / 4096 - 1));
 	put(&gmu, "sys_bus_config", GMU_SYS_BUS_CONFIG, 1);
 	put(&gmu, "icache_config", GMU_ICACHE_CONFIG, 1);
@@ -2331,8 +2418,8 @@ static uint32_t core_khz;               /* the 3D core's speed, as asked of the 
 
 /*
  * What the vendor's driver sends at this point (a6xx_hfi_start; Linux the same with fewer
- * levels): the table of speeds of the 3D core with the supply level each needs -- the phone's
- * three lowest (dt: qcom,gpu-pwrlevels: 315, 450, 550 MHz at "levels" 64, 128, 192) -- and of the
+ * levels): the table of speeds of the 3D core with the supply level each needs -- the phone's own,
+ * every row of them (see struct gpu_hw: dt qcom,gpu-pwrlevels of its speed bin) -- and of the
  * GMU itself; the table of bus bandwidth votes, of which Linux gets by with the one for "off"
  * (a6xx_hfi.c: adreno_7c3_build_bw_table); "start"; and the speed wanted now. Then the request
  * to keep the 3D core powered while we use it (a6xx_gmu_oob_set), and its registers can be read.
@@ -2340,12 +2427,11 @@ static uint32_t core_khz;               /* the 3D core's speed, as asked of the 
 static bool
 step_core_power(void)
 {
-	static const struct {
-		uint32_t khz, level;
-	} speeds[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } };
+	const struct gpu_hw *gpu_hw = hw;
 	static struct hfi_perf_table perf;
 	static struct hfi_bw_table bw;
-	uint32_t core_start[2] = { 0, 0 }, start[1] = { 0 }, vote[4] = { 0, 1, 3, HFI_NO_INDEX }, granted = 0, speed = 0;
+	uint32_t core_start[2] = { 0, 0 }, start[1] = { 0 }, granted = 0, speed = 0;
+	uint32_t vote[4] = { 0, 1, gpu_hw->speed_wanted, HFI_NO_INDEX };
 	uint16_t gfx[16], cx[16], mx[16];
 	unsigned gfx_levels, cx_levels, mx_levels;
 
@@ -2357,12 +2443,12 @@ step_core_power(void)
 		printf("adreno: %u: RPMh's list lacks one of the rails\n", step);
 		return false;
 	}
-	perf.gpu_levels = sizeof(speeds) / sizeof(speeds[0]);
+	perf.gpu_levels = gpu_hw->speeds_count;
 	for (unsigned i = 0; i < perf.gpu_levels; i++) {
-		perf.gpu[i].khz = speeds[i].khz;
+		perf.gpu[i].khz = gpu_hw->speeds[i].khz;
 		perf.gpu[i].acd = 0xffffffff;           /* no adaptive clocking */
-		if (!rail_vote(speeds[i].level, gfx, gfx_levels, mx, mx_levels, &perf.gpu[i].vote)) {
-			printf("adreno: %u: RPMh has no level %u for the 3D core's rail\n", step, speeds[i].level);
+		if (!rail_vote(gpu_hw->speeds[i].level, gfx, gfx_levels, mx, mx_levels, &perf.gpu[i].vote)) {
+			printf("adreno: %u: RPMh has no level %u for the 3D core's rail\n", step, gpu_hw->speeds[i].level);
 			return false;
 		}
 	}
@@ -2372,8 +2458,12 @@ step_core_power(void)
 	    !rail_vote(48, cx, cx_levels, mx, mx_levels, &perf.gmu[1].vote)) {  /* "minimum SVS", the vendor's choice */
 		return false;
 	}
-	printf("adreno: %u: votes: 3D core %#x %#x %#x %#x, GMU %#x %#x\n", step, perf.gpu[0].vote, perf.gpu[1].vote,
-	    perf.gpu[2].vote, perf.gpu[3].vote, perf.gmu[0].vote, perf.gmu[1].vote);
+	printf("adreno: %u: %u speeds from the phone's device tree, and the level each needs (vote, MHz):", step,
+	    perf.gpu_levels);
+	for (unsigned i = 0; i < perf.gpu_levels; i++) {
+		printf(" %#x/%u", perf.gpu[i].vote, perf.gpu[i].khz / 1000);
+	}
+	printf("; GMU %#x %#x\n", perf.gmu[0].vote, perf.gmu[1].vote);
 
 	bw.levels = 1;
 	bw.ddr_commands = 3;
@@ -2396,7 +2486,7 @@ step_core_power(void)
 	if (PE_parse_boot_argn("adreno_speed", &speed, sizeof(speed)) && speed >= 1 && speed < perf.gpu_levels) {
 		vote[2] = speed;
 	}
-	core_khz = speeds[vote[2]].khz;
+	core_khz = gpu_hw->speeds[vote[2]].khz;
 	printf("adreno: %u: the speed wanted: %u MHz\n", step, core_khz / 1000);
 	announce("send the GMU its tables (speeds and supply levels, bus votes), \"start\", and the speed wanted; "
 	    "from here on it casts votes in RPMh by itself");
@@ -2423,6 +2513,26 @@ step_core_power(void)
 	if (!(granted & GMU_CORE_GRANTED) || (rd(gmu.base + GMU_SPTPRAC_PWR_CLK_STATUS) & 0xc0) != 0) {
 		printf("adreno: %u: the GMU does not power the 3D core (gmu2host_intr_info %#x, fw_init_result %#x)\n", step,
 		    granted, rd(gmu.base + GMU_CM3_FW_INIT_RESULT));
+		/*
+		 * What the GMU made of the request: its side's enables for our interrupts, what it holds up,
+		 * and the state of the power switch and of the core's clock, which it and nobody else writes.
+		 */
+		get(&gmu, "gmu2host_intr_mask", GMU_WORD(0x5193));
+		get(&gmu, "host2gmu_intr_raw", GMU_WORD(0x5196));
+		get(&gmu, "host2gmu_intr_en_0", GMU_WORD(0x5197));
+		get(&gmu, "host2gmu_intr_en_1", GMU_WORD(0x5198));
+		get(&gmu, "host2gmu_intr_en_2", GMU_WORD(0x5199));
+		get(&gmu, "host2gmu_intr_en_3", GMU_WORD(0x519a));
+		get(&gmu, "host2gmu_intr_info_0", GMU_WORD(0x519b));
+		get(&gmu, "host2gmu_intr_info_1", GMU_WORD(0x519c));
+		get(&gmu, "host2gmu_intr_info_2", GMU_WORD(0x519d));
+		get(&gmu, "host2gmu_intr_info_3", GMU_WORD(0x519e));
+		get(&gmu, "ao_host_interrupt_status", GMU_AO_HOST_INTERRUPT_STATUS);
+		get(&gmu, "ao_host_interrupt_mask", GMU_WORD(0x9306));
+		get(&gmu, "gx_sptprac_power_control", GMU_GX_SPTPRAC_POWER_CONTROL);
+		get(&gmu, "cpr fsm control", GMU_CPR_FSM_CTL);
+		get(&gpucc, "pll0 mode", GPUCC_PLL0_MODE);
+		get(&gpucc, "pll0 multiplier", GPUCC_PLL0_MODE + 4);
 		space_faulted(&gmu_space);
 		return false;
 	}
@@ -3820,6 +3930,7 @@ hakios_adreno_init(void)
 	uint32_t only = 0, done = 0, failed = 0, keep = 0;
 	bool by_itself = false;
 
+	hw_select();
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
 		display_probe();
 	}
