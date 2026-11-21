@@ -1936,8 +1936,14 @@ step_gmu_firmware(void)
 struct gpu_hw {
 	const char *device;
 
-	/* what the GMU's firmware is told this GPU is */
+	/* what the GMU's firmware is told this GPU is, and what the system is told (dt qcom,chipid) */
 	uint32_t chip;
+	uint64_t chip_raw;
+
+	/* the core's own memory, and how its tiled and compressed layouts are laid out (dt qcom,gmem,
+	   qcom,highest-bank-bit, qcom,ubwc-mode, qcom,min-access-length) */
+	uint32_t gmem_size;
+	unsigned highest_bank_bit, ubwc_mode, min_access_length;
 
 	/* the 3D core's speeds, lowest first, row 0 being "off" */
 	struct {
@@ -1952,6 +1958,9 @@ struct gpu_hw {
 static const struct gpu_hw hw_redwood = {
 	.device = "redwood",
 	.chip = 0x06035000,                     /* dt qcom,chipid 0x06030500 the way the firmware wants it */
+	.chip_raw = 0x06030500ull,
+	.gmem_size = 512 * 1024,
+	.highest_bank_bit = 14, .ubwc_mode = 4, .min_access_length = 32,
 	.speeds = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } },
 	.speeds_count = 4,
 	.speed_wanted = 3,
@@ -1961,6 +1970,9 @@ static const struct gpu_hw hw_redwood = {
 static const struct gpu_hw hw_renoir = {
 	.device = "renoir",
 	.chip = 0x06060000,                     /* dt qcom,chipid 0x06060010; the firmware's a660 entry is 0x00060600 */
+	.chip_raw = 0x06060010ull,
+	.gmem_size = 1024 * 1024 + 512 * 1024,  /* the vendor's a642: SZ_1M + SZ_512K */
+	.highest_bank_bit = 15, .ubwc_mode = 4, .min_access_length = 32,
 	.speeds = {
 		{ 0, 0 },
 		{ 285000, 64 },                 /* qcom,gpu-pwrlevel@7: LOW_SVS */
@@ -2899,14 +2911,23 @@ step_core_start(void)
 	put(&gpu, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, 0x00200200);
 	put(&gpu, "cp_ahb_cntl", CP_AHB_CNTL, 1);
 	/*
-	 * How textures in the GPU's own tiled and compressed layouts are laid out in memory (Linux's
-	 * a6xx_calc_ubwc_config, a6xx_set_ubwc_config for this GPU: highest bank bit 14, and the
-	 * rest as below); Mesa is told the same (hakios_gpu_parameter()).
+	 * How textures in the GPU's own tiled and compressed layouts are laid out in memory, as the
+	 * vendor's a6xx_set_ubwc_config computes it from the phone's device tree (qcom,highest-bank-bit,
+	 * qcom,ubwc-mode, qcom,min-access-length): the highest bank bit in three places, UBWC 4.0's
+	 * rgb565_predicator and amsbc, and the 650 family's uavflagprd_inv. Mesa is told the same
+	 * (hakios_gpu_parameter()).
 	 */
-	put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08), 1u << 11 | 1u << 4 | 1u << 1);
-	put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), 1u << 1);
-	put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), 2u << 4 | 1u << 1);
-	put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), 1u << 21);
+	{
+		unsigned hbb = hw->highest_bank_bit, lo = (hbb - 13) & 3, hi = ((hbb - 13) >> 2) & 1;
+		unsigned rgb565_predicator = hw->ubwc_mode >= 4, amsbc = hw->ubwc_mode >= 3;
+		unsigned mal = hw->min_access_length == 64, uavflagprd_inv = 2;     /* the 650 family's */
+
+		put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08),
+		    rgb565_predicator << 11 | hi << 10 | amsbc << 4 | mal << 3 | lo << 1);
+		put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), hi << 4 | mal << 3 | lo << 1);
+		put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), hi << 10 | mal << 3 | uavflagprd_inv << 4 | lo << 1);
+		put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), mal << 23 | lo << 21);
+	}
 	put(&gpu, "rbbm_nc_mode_cntl", GPU_WORD(0x0534), 1);
 	put(&gpu, "rbbm_perfctr_cntl", RBBM_PERFCTR_CNTL, 1);
 	put(&gpu, "rbbm_interface_hang_int_cntl", RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x1fffff);
@@ -3333,7 +3354,6 @@ hakios_adreno_quiesce(void)
  * far it has got (a "fence": a submission's number, written by the core when it is through
  * with it). The caller holds one lock around all of these.
  */
-#define GPU_CHIP_ID             0x06030500ull   /* dt: qcom,chipid */
 #define GPU_ADDRESSES_START     0x20000000ull   /* above everything the steps use; below 4 GB, as Linux keeps them */
 #define GPU_ADDRESSES_SIZE      0xe0000000ull
 #define GPU_FENCE_AT            0x40            /* in the scratch page */
@@ -3431,10 +3451,10 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 0;
 		return true;
 	case 0x02:                              /* GMEM_SIZE */
-		*value = 512 * 1024;
+		*value = hw->gmem_size;
 		return true;
 	case 0x03:                              /* CHIP_ID, with the speed bin above it */
-		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
+		*value = hw->chip_raw | (uint64_t)speed_bin << 32;
 		return true;
 	case 0x04:                              /* MAX_FREQ */
 		*value = core_khz * 1000ull;
@@ -3446,7 +3466,7 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 1;
 		return true;
 	case 0x10:                              /* HIGHEST_BANK_BIT */
-		*value = 14;
+		*value = hw->highest_bank_bit;
 		return true;
 	case 0x12:                              /* UBWC_SWIZZLE */
 		*value = 6;
