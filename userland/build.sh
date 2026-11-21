@@ -81,6 +81,11 @@
 #                    the kernel's apfs_lib has to read every volume back as the directory it was made of
 #                    (../tools/apfs/check-image.sh; the system image takes a few minutes more)
 set -e
+# The permission bits of the files this puts in the images are the files' own (tools/apfs/mkapfs.py takes them from the
+# tree it is given), and launchd refuses a LaunchDaemons plist that anyone but its owner can write: "Caller specified a
+# plist with bad ownership/permissions". With the umask a shell often has (0002) every plist would come out 0664 and no
+# job would load, so the tree is built with 022 whatever the caller's umask is.
+umask 022
 # a copy of a tree that shares its files' data: hard links (Linux), clones of the files (macOS's APFS, whose cp has no -l)
 linkcopy() { if [ "$(uname)" = Darwin ]; then cp -cRp "$1" "$2"; else cp -al "$1" "$2"; fi; }
 cd "$(dirname "$(readlink -f "$0")")"
