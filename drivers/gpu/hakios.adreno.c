@@ -794,6 +794,49 @@ measure_quietly(uint32_t select)
 }
 
 /*
+ * The counter is a debug facility of the SoC, and on this phone's it does not count: its own self-check, the crystal,
+ * reads 0 Hz where the crystal is 19.2 MHz by definition. What the clock branches' control registers say is usable
+ * instead -- bit 31 marks a branch that is off -- and here they say it plainly (gcc gpu_cfg_ahb 0x9, memnoc 0x4221,
+ * snoc 0x1, the off bit clear in all three), where the reference phone's do not, which is why the counter was written
+ * for it. So when the counter cannot be believed the registers decide, and the log says which of the two decided.
+ */
+static bool
+clocks_from_cbcr(void)
+{
+	static const struct {
+		const char *name;
+		struct block *where;
+		uint32_t offset;
+	} branches[] = {
+		{ "gcc gpu_cfg_ahb (the GPU clock controller's register bus)", &gcc, GCC_GPU_CFG_AHB_CBCR },
+		{ "gcc gpu_memnoc_gfx", &gcc, GCC_GPU_MEMNOC_GFX_CBCR },
+		{ "gcc gpu_snoc_dvm_gfx", &gcc, GCC_GPU_SNOC_DVM_GFX_CBCR },
+		{ "gpucc ahb", &gpucc, GPUCC_AHB_CBCR },
+		{ "gpucc cx_gmu (the GMU)", &gpucc, GPUCC_CX_GMU_CBCR },
+		{ "gpucc hub_cx_int", &gpucc, GPUCC_HUB_CX_INT_CBCR },
+	};
+	bool bus_on = false;
+
+	printf("adreno: %u: the counter cannot be believed here; the clock branches' own control registers decide\n", step);
+	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); i++) {
+		uint32_t value = rd(branches[i].where->base + branches[i].offset);
+		bool on = !(value & CBCR_OFF);
+
+		printf("adreno: %u: %s (%#x) = %#x: %s\n", step, branches[i].name,
+		    (uint32_t)(branches[i].where->phys + branches[i].offset), value, on ? "on" : "OFF");
+		if (i == 0) {
+			bus_on = on;
+		}
+	}
+	if (!bus_on) {
+		printf("adreno: %u: the register bus of the GPU block has no clock\n", step);
+		return false;
+	}
+	printf("adreno: %u: THE REGISTER BUS OF THE GPU BLOCK HAS ITS CLOCK, by its control register\n", step);
+	return true;
+}
+
+/*
  * Measure the clocks step 5 has turned on. The crystal's comes first and aloud: its rate is known,
  * so it shows whether the counter can be believed; one that is off (the 3D core's) comes last.
  */
@@ -815,12 +858,13 @@ measure_clocks(void)
 	hz = measure(GPUCC_DEBUG_CXO);
 	if (hz == MEASURE_FAILED) {
 		printf("adreno: %u: the counter did not finish: it cannot be used as it is set up here\n", step);
-		return false;
+		return clocks_from_cbcr();
 	}
 	printf("adreno: %u: measured: cxo runs at %u Hz (the crystal: 19200000)\n", step, hz);
 	if (hz < 18600000 || hz > 19800000) {
-		printf("adreno: %u: the counter does not show the crystal's rate: nothing it says can be used\n", step);
-		return false;
+		printf("adreno: %u: the counter does not show the crystal's rate (%u Hz): nothing it says can be used\n", step,
+		    hz);
+		return clocks_from_cbcr();
 	}
 	for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
 		hz = measure_quietly(clocks[i].select);
@@ -876,8 +920,19 @@ cx_ready(void)
 		printf("adreno: %u: the GPU block's register bus clock (ahb) measures %u Hz\n", step, ahb_hz);
 	}
 	if (ahb_hz == MEASURE_FAILED || ahb_hz < 1000000) {
-		printf("adreno: %u: without that clock a register of the GPU block would not answer: not touching it\n", step);
-		return false;
+		/*
+		 * The counter says nothing on this phone's SoC, so it cannot say whether the register bus runs either. Its
+		 * branch's control register can, and does (no off bit): ask that instead of giving up, and say so.
+		 */
+		uint32_t value = rd(gcc.base + GCC_GPU_CFG_AHB_CBCR);
+
+		if (value & CBCR_OFF) {
+			printf("adreno: %u: without that clock a register of the GPU block would not answer: not touching it "
+			    "(gcc gpu_cfg_ahb %#x)\n", step, value);
+			return false;
+		}
+		printf("adreno: %u: the counter says nothing here, and gcc gpu_cfg_ahb (%#x) has its off bit clear: the "
+		    "register bus runs, so the block is read\n", step, value);
 	}
 	return true;
 }
