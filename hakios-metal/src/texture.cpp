@@ -467,13 +467,13 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
         id.chip_id = chip().chipId;
         // Mesa's row for the chip, with the bank bit the kernel programmed the GPU's own layouts with (chip.hpp: the
         // device tree's, which the row does not always agree with)
-        struct ::fd_dev_info info{};
+        struct ::fd_dev_info rowInfo{};
         const struct ::fd_dev_info* row = ::fd_dev_info_raw(&id);
         if (row != nullptr) {
-            info = *row;
-            info.highest_bank_bit = chip().highestBankBit;
+            rowInfo = *row;
+            rowInfo.highest_bank_bit = chip().highestBankBit;
         }
-        const struct ::fd_dev_info* dev = row != nullptr ? &info : nullptr;
+        const struct ::fd_dev_info* dev = row != nullptr ? &rowInfo : nullptr;
         fdl_layout l{};
         l.ubwc = true;
         l.tile_mode = a6xx::TILE6_3;
