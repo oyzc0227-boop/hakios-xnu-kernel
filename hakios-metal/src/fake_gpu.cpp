@@ -1,4 +1,5 @@
 #include "hakios-metal/fake_gpu.hpp"
+#include "hakios-metal/chip.hpp"
 
 #include <cerrno>
 #include <cmath>
@@ -361,8 +362,8 @@ bool FakeGpu::loadState(uint32_t opcode, const uint32_t* p, uint32_t count) {
         return false;
     }
     uint32_t unitBytes = texBlock ? (type == ST6_SHADER ? 16 : 64) : type == ST6_SHADER ? 128 : type == ST6_CONSTANTS ? 16 : type == ST6_UBO ? 8 : 64;
-    if (!texBlock && type == ST6_SHADER && units > kInstrCacheSize) {
-        fault(text("a program preload of %llu units: 128 hangs this GPU, the instruction cache holds %llu", units, kInstrCacheSize));
+    if (!texBlock && type == ST6_SHADER && units > chip().instrCacheSize) {
+        fault(text("a program preload of %llu units: 128 hangs this GPU, the instruction cache holds %llu", units, uint64_t(chip().instrCacheSize)));
         return false;
     }
     uint64_t from = 0;
@@ -2437,8 +2438,8 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
         // the kernel's table (bsd/dev/hakios.adreno.c, hakios_gpu_parameter), number for number
         switch (p->param) {
         case kParamGpuId: p->value = 0; return 0;                   // "none, the chip ID says it"
-        case kParamGmemSize: p->value = kGmemBytes; return 0;
-        case kParamChipId: p->value = kChipId | kSpeedBin << 32; return 0;
+        case kParamGmemSize: p->value = chip().gmemBytes; return 0;
+        case kParamChipId: p->value = chip().chipId | kSpeedBin << 32; return 0;
         case kParamMaxFreq: p->value = kMaxFrequencyHz; return 0;
         case kParamTimestamp: p->value = uint64_t(nowNs()); return 0;
         case kParamGmemBase: p->value = 0; return 0;
@@ -2446,10 +2447,10 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
         case kParamPpPgtable: p->value = 0; return 0;
         case kParamFaults: p->value = stats_.recoveries; return 0;
         case kParamSuspends: p->value = 0; return 0;
-        case kParamHighestBankBit: p->value = 14; return 0;
+        case kParamHighestBankBit: p->value = chip().highestBankBit; return 0;
         case kParamRaytracing: p->value = 0; return 0;
-        case kParamUbwcSwizzle: p->value = 6; return 0;
-        case kParamMacrotileMode: p->value = 1; return 0;
+        case kParamUbwcSwizzle: p->value = chip().ubwcSwizzle; return 0;
+        case kParamMacrotileMode: p->value = chip().macrotileMode; return 0;
         default: return EINVAL;                                      // (kIOReturnBadArgument there: VA_START, VA_SIZE among them)
         }
     }

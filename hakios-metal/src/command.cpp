@@ -1,4 +1,5 @@
 #include "hakios-metal/command.hpp"
+#include "hakios-metal/chip.hpp"
 #include "hakios-metal/texture.hpp"
 
 #include <algorithm>
@@ -555,11 +556,9 @@ std::shared_ptr<Texture> CommandQueue::nullTexture(std::string* why) {
     return null_;
 }
 
-namespace {
-// the A635's SP cores and fibers an SP (freedreno_devices.py, the 7c+ Gen 3 entry: num_ccu 2, fibers_per_sp 128 * 2 * 16)
-constexpr uint32_t kSpCores = 2;
-constexpr uint32_t kFibersPerSp = 128 * 2 * 16;
-}  // namespace
+// The SP cores and the fibers an SP holds are the chip's (chip.hpp: Mesa's num_sp_cores and fibers_per_sp -- 2 and
+// 128 * 2 * 16 on the reference phone, 3 and the same on the Mi 11 Lite 5G): the private memory a dispatch needs is one
+// SP's worth for every SP.
 
 std::shared_ptr<Buffer> CommandQueue::privateMemory(uint32_t bytes, bool perWave, PrivateMemory* out, std::string* why) {
     std::lock_guard<std::mutex> g(lock_);
@@ -567,8 +566,8 @@ std::shared_ptr<Buffer> CommandQueue::privateMemory(uint32_t bytes, bool perWave
     if (privatePerFiber_[l] < bytes) {
         uint32_t perFiber = 512;
         while (perFiber < bytes) perFiber *= 2;
-        const uint64_t perSp = (uint64_t(perFiber) * kFibersPerSp + 4095) & ~uint64_t(4095);
-        std::shared_ptr<Buffer> b = newBuffer(gpu_, perSp * kSpCores, why);
+        const uint64_t perSp = (uint64_t(perFiber) * chip().fibersPerSp + 4095) & ~uint64_t(4095);
+        std::shared_ptr<Buffer> b = newBuffer(gpu_, perSp * chip().numSpCores, why);
         if (b == nullptr) return nullptr;
         private_[l].push_back(std::move(b));
         privatePerFiber_[l] = perFiber;
@@ -576,7 +575,7 @@ std::shared_ptr<Buffer> CommandQueue::privateMemory(uint32_t bytes, bool perWave
     const uint32_t perFiber = privatePerFiber_[l];
     out->address = private_[l].back()->gpuAddress();
     out->perFiber = perFiber;
-    out->perSp = uint32_t((uint64_t(perFiber) * kFibersPerSp + 4095) & ~uint64_t(4095));
+    out->perSp = uint32_t((uint64_t(perFiber) * chip().fibersPerSp + 4095) & ~uint64_t(4095));
     out->perWave = perWave;
     return private_[l].back();
 }

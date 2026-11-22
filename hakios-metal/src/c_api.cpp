@@ -21,6 +21,7 @@
 #include "hakios-metal/fake_gpu.hpp"
 #include "hakios-metal/hakios_metal.h"
 #include "hakios-metal/a6xx.hpp"
+#include "hakios-metal/chip.hpp"
 #include "hakios-metal/metallib.hpp"
 #include "../tests/fixtures/null_fs_bc.hpp"
 #include "hakios-metal/texture.hpp"
@@ -212,10 +213,21 @@ void hakios_metal_buffer_counts(unsigned* made, unsigned* reused, unsigned long 
 
 const char* hakios_metal_error(void) { return lastError.c_str(); }
 
-// Tiles, GMEM offsets and the shader compiler are built for one chip (a6xx.hpp). A kernel that does not say (0) is taken at its
-// word that it is that one: only a chip it names as another is refused, so that the window server stays on OpenGL ES there.
-bool hakios_metal_chip_known(uint32_t chip) { return chip == 0 || chip == a6xx::kChipId; }
-static bool chipKnown(uint32_t chip) { return hakios_metal_chip_known(chip); }
+// Tiles, GMEM offsets and the shader compiler are built for one chip (chip.hpp). A kernel that does not say (0) is taken
+// at its word that it is the one the tables were written for: only a chip no row is refused, so that the window server
+// stays on OpenGL ES there.
+bool hakios_metal_chip_known(uint32_t chip) { return chip == 0 || chipFor(chip) != nullptr; }
+
+// The chip the kernel is driving: its row, then what the kernel says about the two numbers it knows better (the
+// memory the phone's board has and the bank bit the kernel programmed the GPU's own layouts with).
+static void selectChip(Gpu& gpu, uint32_t chipId) {
+    if (chipId != 0) chipSelect(chipId);
+    uint64_t gmem = 0, bankBit = 0;
+    uint32_t bytes = 0, bit = 0;
+    if (gpu.param(kParamGmemSize, &gmem) == 0 && gmem != 0 && gmem <= 0xffffffffu) bytes = uint32_t(gmem);
+    if (gpu.param(kParamHighestBankBit, &bankBit) == 0 && bankBit >= 13 && bankBit <= 16) bit = uint32_t(bankBit);
+    chipSetFromKernel(bytes, bit);
+}
 
 static hakios_metal_device* deviceOn(std::unique_ptr<Transport> t) {
     auto* d = new hakios_metal_device;
@@ -233,14 +245,17 @@ hakios_metal_device* hakios_metal_open(void) {
         return nullptr;
     }
     hakios_metal_device* d = deviceOn(std::move(t));
-    if (!chipKnown(d->gpu->chipId())) {
-        char text[160];
-        snprintf(text, sizeof(text), "the GPU's chip ID is %#x: the tables of this driver are the Adreno's of chip ID %#x (a6xx.hpp), another's would hang it",
-                 d->gpu->chipId(), a6xx::kChipId);
+    const uint32_t chipId = d->gpu->chipId();
+    if (!hakios_metal_chip_known(chipId)) {
+        char text[200];
+        snprintf(text, sizeof(text),
+                 "the GPU's chip ID is %#x: this driver's tables are the Adreno of chip ID %#x (%s) and %#x (%s), another's would hang it",
+                 chipId, kChipA635.chipId, kChipA635.name, kChipA660.chipId, kChipA660.name);
         failed(text);
         delete d;
         return nullptr;
     }
+    selectChip(*d->gpu, chipId);
     return d;
 #endif
 #endif
@@ -248,7 +263,11 @@ hakios_metal_device* hakios_metal_open(void) {
     return nullptr;
 }
 
-hakios_metal_device* hakios_metal_open_fake(void) { return deviceOn(std::make_unique<FakeGpu>(true)); }
+hakios_metal_device* hakios_metal_open_fake(void) {
+    hakios_metal_device* d = deviceOn(std::make_unique<FakeGpu>(true));
+    selectChip(*d->gpu, d->gpu->chipId());
+    return d;
+}
 
 void hakios_metal_close(hakios_metal_device* d) { delete d; }
 

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "hakios-metal/a6xx.hpp"
+#include "hakios-metal/chip.hpp"
 #include "hakios-metal/command.hpp"
 #include "hakios-metal/fake_gpu.hpp"
 #include "hakios-metal/render.hpp"
@@ -5361,6 +5362,26 @@ TEST(the_gmem_plan_fits_the_bins_in_gmem_and_covers_the_target) {
         b.color0 = i.get();
         CHECK(!render::gmemPlan(b, &p, &why));
     }
+}
+
+// The Mi 11 Lite 5G's Adreno (chip.hpp's second row): three CCUs, a tile 96 wide (not a power of two, so the grid's
+// corner is aligned with a division), and 1.5 MiB of GMEM below its colour cache. The plan must be the same shape it is
+// on the reference phone and must still cover the window.
+TEST(a_render_pass_tiles_at_the_second_chips_width) {
+    CHECK(chipSelect(0x06060010));
+    for (const auto& [w, h] : {std::pair<uint32_t, uint32_t>{1125, 2436}, {96, 96}, {100, 37}, {1919, 47}}) {
+        Rig r;
+        auto t = target(r, w, h, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        RenderPass a;
+        a.color0 = t.get();
+        render::GmemPlan p;
+        std::string why;
+        CHECK(render::gmemPlan(a, &p, &why));
+        CHECK(p.binW % 96 == 0 && p.binH % 16 == 0 && p.binW <= 1024 && p.binH <= 1008);
+        CHECK(uint64_t(p.binW) * p.binH * 4 <= chip().gmemCcuColorOffset());
+        CHECK(p.cols * p.binW >= w && (p.cols - 1) * p.binW < w && p.rows * p.binH >= h && (p.rows - 1) * p.binH < h);
+    }
+    CHECK(chipSelect(0x06030500));   // back to the reference phone for the tests that follow
 }
 
 TEST(a_pass_in_gmem_loads_and_stores_every_tile_in_place) {

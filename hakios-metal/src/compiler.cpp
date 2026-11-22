@@ -17,6 +17,7 @@
 #include "common/freedreno_dev_info.h"
 #include "util/ralloc.h"
 #include "hakios-metal/a6xx.hpp"
+#include "hakios-metal/chip.hpp"
 #endif
 
 namespace hakios::metal {
@@ -51,12 +52,13 @@ namespace {
 
 std::mutex gCompilerLock;   // ir3 keeps state in the compiler object; one compilation at a time
 
-// one compiler for the chip, as the kernel names it: Mesa's table resolves 0x06030500 to the Adreno 7c+ Gen 3 row
+// one compiler for the chip, as the kernel names it: Mesa's table resolves the chip id to its row (chip.hpp says which
+// row that is for each of the Adrenos this driver serves)
 ir3_compiler* theCompiler() {
     static ir3_compiler* compiler = [] {
         fd_dev_id id{};
         id.gpu_id = 0;
-        id.chip_id = a6xx::kChipId;
+        id.chip_id = chip().chipId;
         // A framebuffer fetch (nir_texop_txf_ms_fb) through the FS's own texture table, at the slot after its last
         // texture, as turnip has it (tu_device.cc: -1): the zero default would make it a bindless read of descriptor
         // set 0, which this driver never binds
@@ -73,6 +75,13 @@ ir3_compiler* theCompiler() {
 bool refuse(std::string* why, const std::string& text) {
     *why = text;
     return false;
+}
+
+// the chip's id as the refusals say it
+std::string chipIdText() {
+    char text[16];
+    snprintf(text, sizeof(text), "%#x", chip().chipId);
+    return text;
 }
 
 // KernelTextureDim from the NIR's sampler dimension; false, with the dimension's name, for the ones no Texture can be
@@ -1070,7 +1079,7 @@ bool hasCompiler() { return theCompiler() != nullptr; }
 std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
     std::lock_guard<std::mutex> g(gCompilerLock);
     if (theCompiler() == nullptr) {
-        refuse(why, "ir3 has no compiler for chip 0x06030500");
+        refuse(why, "ir3 has no compiler for chip " + chipIdText());
         return nullptr;
     }
     Translation t;
@@ -1279,7 +1288,7 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
                                            const KnownBuffer* known) {
     std::lock_guard<std::mutex> g(gCompilerLock);
     if (theCompiler() == nullptr) {
-        refuse(why, "ir3 has no compiler for chip 0x06030500");
+        refuse(why, "ir3 has no compiler for chip " + chipIdText());
         return nullptr;
     }
     const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);

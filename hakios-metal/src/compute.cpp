@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "hakios-metal/a6xx.hpp"
+#include "hakios-metal/chip.hpp"
 #include "hakios-metal/command.hpp"
 #include "hakios-metal/texture.hpp"
 
@@ -185,7 +186,8 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
         return refuse(why, std::string(k.name) + " names texture or sampler indices past " + n(kMaxTextureSlots - 1) + ": the tables hold " + n(kMaxTextureSlots));
     }
     a6xx_threadsize threadsize = k.doubleThreadsize ? THREAD128 : THREAD64;
-    uint32_t subgroup = k.doubleThreadsize ? 2 * kThreadsizeBase : kThreadsizeBase;
+    const uint32_t threadsizeBase = chip().threadsizeBase;
+    uint32_t subgroup = k.doubleThreadsize ? 2 * threadsizeBase : threadsizeBase;
 
     // --- the buffers: one descriptor per IBO slot, sized as the kernel declared or as the buffer is ---
     uint32_t nibo = std::max(k.numBufs, k.numIbos);
@@ -457,7 +459,8 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
         stream.registers(REG_A6XX_SP_CS_PVT_MEM_PARAM, v, 4);
         reg(stream, REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET, 0);
     }
-    loadIndirect(stream, ST6_SHADER, 0, std::min({k.instrlen, kInstrCacheSize, o.preloadCap != 0 ? o.preloadCap : kInstrCacheSize}), program);
+    const uint32_t cache = chip().instrCacheSize;
+    loadIndirect(stream, ST6_SHADER, 0, std::min({k.instrlen, cache, o.preloadCap != 0 ? o.preloadCap : cache}), program);
     if (immUnits != 0) {
         loadDirect(stream, ST6_CONSTANTS, k.immediatesOffsetVec4, immUnits, imm.data(), uint32_t(imm.size()));
     }
@@ -535,7 +538,7 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
     // with SP_FS_INSTRLEN left as it was, a 134-unit chain finished with every word wrong and a 492-unit one hung. So the
     // FS length is set to the kernel's and a LABEL event rolls the context before the dispatch, and another after it, so
     // that the write and CP_EXEC_CS cannot race.
-    const bool instrlenWorkaround = k.instrlen > kInstrCacheSize || (o.preloadCap != 0 && k.instrlen > o.preloadCap);
+    const bool instrlenWorkaround = k.instrlen > chip().instrCacheSize || (o.preloadCap != 0 && k.instrlen > o.preloadCap);
     if (instrlenWorkaround) {
         reg(stream, REG_A6XX_SP_FS_INSTRLEN, k.instrlen);
         event(stream, LABEL);

@@ -14,6 +14,7 @@
 #include <tuple>
 
 #include "hakios-metal/a6xx.hpp"
+#include "hakios-metal/chip.hpp"
 #include "hakios-metal/command.hpp"
 #include "hakios-metal/texture.hpp"
 
@@ -1740,7 +1741,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
              {0, uint32_t(address), uint32_t(address >> 32), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(pm.perFiber), uint32_t(pm.address),
               uint32_t(pm.address >> 32), A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(pm.perSp) | (pm.perWave ? A6XX_SP_CS_PVT_MEM_SIZE_PERWAVEMEMLAYOUT : 0u)});
         reg(stream, regHwStackOffset, A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(pm.perSp));
-        loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, kInstrCacheSize), address);
+        loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, chip().instrCacheSize), address);
         if (s.k.numImmediates != 0) {
             std::vector<uint32_t> imm(s.k.immediates, s.k.immediates + s.k.numImmediates);
             imm.resize((imm.size() + 3) & ~size_t(3), 0);
@@ -2184,8 +2185,8 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why) {
         // loaded, but both must lie inside the texture's buffer.
         const uint64_t base = t.levelAddress(a.level) + (a.slice != 0 ? uint64_t(a.slice) * t.sliceBytes() : 0);
         const uint64_t start = base - t.buffer()->gpuAddress();
-        if (L.pitch < uint64_t(alignUp(W, kGmemAlignW)) * f.bytesPerPixel || L.pitch % 64 != 0 ||
-            start + uint64_t(alignUp(H, kGmemAlignH)) * L.pitch > t.buffer()->length()) {
+        if (L.pitch < uint64_t(alignUp(W, chip().gmemAlignW)) * f.bytesPerPixel || L.pitch % 64 != 0 ||
+            start + uint64_t(alignUp(H, chip().gmemAlignH)) * L.pitch > t.buffer()->length()) {
             return refuse(why, which + ": rows without room for the event blit's granules past the edge");
         }
         bytes += f.bytesPerPixel;
@@ -2198,9 +2199,10 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why) {
         const Attachment a = attachmentOf(pass, i);
         if (a.texture == nullptr) continue;
         p.bpp[i] = a.texture->info().bytesPerPixel;
-        p.base[i] = uint32_t(uint64_t(kGmemCcuColorOffset) * before / bytes) & ~0x3fffu;
+        const uint32_t gmemBelowCcu = chip().gmemCcuColorOffset();
+        p.base[i] = uint32_t(uint64_t(gmemBelowCcu) * before / bytes) & ~0x3fffu;
         before += p.bpp[i];
-        p.room[i] = (uint32_t(uint64_t(kGmemCcuColorOffset) * before / bytes) & ~0x3fffu) - p.base[i];
+        p.room[i] = (uint32_t(uint64_t(gmemBelowCcu) * before / bytes) & ~0x3fffu) - p.base[i];
     }
     const uint32_t whole[4] = {0, 0, W - 1, H - 1};
     if (!gmemTiles(&p, whole)) return refuse(why, "a bin too wide for GMEM");
@@ -2210,25 +2212,28 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why) {
 
 bool gmemTiles(GmemPlan* plan, const uint32_t area[4]) {
     GmemPlan p = *plan;
-    p.x0 = area[0] & ~(kTileAlignW - 1);
-    p.y0 = area[1] & ~(kTileAlignH - 1);
+    // the chip's own tile alignment: 32 wide on the reference phone, 96 on the Mi 11 Lite 5G (three CCUs of 32), so
+    // aligned with a division and not with a mask
+    const uint32_t tileW = chip().tileAlignW, tileH = chip().tileAlignH;
+    p.x0 = area[0] / tileW * tileW;
+    p.y0 = area[1] / tileH * tileH;
     const uint32_t w = area[2] + 1 - p.x0, h = area[3] + 1 - p.y0;
     // The bin width is fixed once a plan has one: a framebuffer fetch's descriptor holds it as its pitch (encodeInPass,
     // written before the area was known), and a tile laid out narrower read through it as sheared rows (the screen in
     // stripes over two tile columns). Only the grid's corner, the columns, the rows and the bin height follow the area.
     if (p.binW == 0) {
-        p.cols = divUp(alignUp(w, kTileAlignW), kTileMaxW);
-        p.binW = alignUp(divUp(w, p.cols), kTileAlignW);
+        p.cols = divUp(alignUp(w, tileW), chip().tileMaxW);
+        p.binW = alignUp(divUp(w, p.cols), tileW);
     } else {
         p.cols = divUp(w, p.binW);
     }
-    uint32_t fit = kTileMaxH;
+    uint32_t fit = chip().tileMaxH;
     for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
-        if (p.bpp[i] != 0) fit = std::min(fit, p.room[i] / (p.binW * p.bpp[i]) / kTileAlignH * kTileAlignH);
+        if (p.bpp[i] != 0) fit = std::min(fit, p.room[i] / (p.binW * p.bpp[i]) / tileH * tileH);
     }
-    if (fit < kTileAlignH) return false;
+    if (fit < tileH) return false;
     p.rows = divUp(h, fit);
-    p.binH = alignUp(divUp(h, p.rows), kTileAlignH);
+    p.binH = alignUp(divUp(h, p.rows), tileH);
     for (uint32_t k = 0; k < 4; k++) p.area[k] = area[k];
     *plan = p;
     return true;
@@ -2331,9 +2336,11 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
     reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlGmem());
     // the event blit's state common to every load and store (event_blit_setup): over the render area in granules
     // (tu6_emit_blit_scissor with align), single-sampled
-    const uint32_t bx1 = std::min(alignUp(plan.area[2] + 1, kGmemAlignW), alignUp(W, kGmemAlignW)) - 1;
-    const uint32_t by1 = std::min(alignUp(plan.area[3] + 1, kGmemAlignH), alignUp(H, kGmemAlignH)) - 1;
-    regs(stream, REG_A6XX_RB_BLIT_SCISSOR_TL, {regXY(plan.area[0] & ~(kGmemAlignW - 1), plan.area[1] & ~(kGmemAlignH - 1)), regXY(bx1, by1)});
+    const uint32_t granuleW = chip().gmemAlignW, granuleH = chip().gmemAlignH;
+    const uint32_t bx1 = std::min(alignUp(plan.area[2] + 1, granuleW), alignUp(W, granuleW)) - 1;
+    const uint32_t by1 = std::min(alignUp(plan.area[3] + 1, granuleH), alignUp(H, granuleH)) - 1;
+    regs(stream, REG_A6XX_RB_BLIT_SCISSOR_TL,
+         {regXY(plan.area[0] / granuleW * granuleW, plan.area[1] / granuleH * granuleH), regXY(bx1, by1)});
     reg(stream, REG_A6XX_RB_BLIT_GMEM_MSAA_CNTL, 0);
     reg(stream, REG_A6XX_RB_UNKNOWN_88D0, 0);
     // one attachment's load or store (event_blit_run): its memory as the destination, its bin where RB_MRT's BASE_GMEM
@@ -2354,10 +2361,10 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
     // The pipes: as fd's gmem layout groups bins (freedreno_gmem.c: tpp_y up by 2 until the rows fit the pipes, then
     // tpp_x up by 1), and each tile's place in its pipe the order the tiles are drawn in
     uint32_t tppX = 1, tppY = 1;
-    while (divUp(plan.rows, tppY) > kNumVscPipes) tppY += 2;
-    while (divUp(plan.rows, tppY) * divUp(plan.cols, tppX) > kNumVscPipes) tppX++;
+    while (divUp(plan.rows, tppY) > chip().numVscPipes) tppY += 2;
+    while (divUp(plan.rows, tppY) * divUp(plan.cols, tppX) > chip().numVscPipes) tppX++;
     const uint32_t pipesX = divUp(plan.cols, tppX);
-    const uint64_t drawStrm = vsc, drawSizes = vsc + uint64_t(kNumVscPipes) * kVscDrawPitch, primStrm = drawSizes + kVscSizesBytes;
+    const uint64_t drawStrm = vsc, drawSizes = vsc + uint64_t(chip().numVscPipes) * kVscDrawPitch, primStrm = drawSizes + kVscSizesBytes;
     auto crumb = [&](uint32_t v) {
         if (o.gmemBinningTrace && vsc != 0) stream.memWrite(drawSizes + kVscTraceAt, &v, 1);
     };
@@ -2379,19 +2386,21 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
         reg64(stream, REG_A6XX_VSC_DRAW_STRM_SIZE_ADDRESS, drawSizes);
         reg(stream, REG_A6XX_VSC_BIN_COUNT, vscBinCount(plan.cols, plan.rows));
         {
-            uint32_t pipes[kNumVscPipes] = {};
+            // the most pipes an a6xx has, and what both chips of this driver have (chip.hpp)
+            constexpr uint32_t kMaxVscPipes = 32;
+            uint32_t pipes[kMaxVscPipes] = {};
             uint32_t p = 0;
             for (uint32_t y = 0; y < plan.rows; y += tppY) {
                 for (uint32_t x = 0; x < plan.cols; x += tppX) {
                     pipes[p++] = vscPipeConfig(x, y, std::min(tppX, plan.cols - x), std::min(tppY, plan.rows - y));
                 }
             }
-            stream.registers(REG_A6XX_VSC_PIPE_CONFIG_REG, pipes, kNumVscPipes);
+            stream.registers(REG_A6XX_VSC_PIPE_CONFIG_REG, pipes, chip().numVscPipes);
         }
         regs(stream, REG_A6XX_VSC_PRIM_STRM_ADDRESS, {uint32_t(primStrm), uint32_t(primStrm >> 32), kVscPrimPitch, kVscPrimPitch - 64});
         regs(stream, REG_A6XX_VSC_DRAW_STRM_ADDRESS, {uint32_t(drawStrm), uint32_t(drawStrm >> 32), kVscDrawPitch, kVscDrawPitch - 64});
-        reg(stream, REG_A6XX_PC_POWER_CNTL, kMagicPcPowerCntl);
-        reg(stream, REG_A6XX_VFD_POWER_CNTL, kMagicPcPowerCntl);
+        reg(stream, REG_A6XX_PC_POWER_CNTL, chip().pcPowerCntl);
+        reg(stream, REG_A6XX_VFD_POWER_CNTL, chip().pcPowerCntl);
         event(stream, UNK_2C);
         reg(stream, REG_A6XX_RB_WINDOW_OFFSET, regXY(0, 0));
         reg(stream, REG_A6XX_SP_TP_WINDOW_OFFSET, regXY(0, 0));
@@ -3279,7 +3288,7 @@ void CommandBuffer::closePass() {
         // (past the right edge the granules land in the row's own padding, which gmemPlan saw the pitch hold; only the
         // rows past the bottom may be another layer's or level's)
         (void)W;
-        const bool inside = render::alignUp(plan.area[3] + 1, a6xx::kGmemAlignH) <= H;
+        const bool inside = render::alignUp(plan.area[3] + 1, chip().gmemAlignH) <= H;
         uint32_t load = 0, store = 0;
         for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
             const Texture* t = i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture;

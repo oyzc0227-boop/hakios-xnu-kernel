@@ -58,9 +58,10 @@ TEST(c_api_copy_and_callbacks) {
     hakios_metal_queue_free(q);
     hakios_metal_close(d);
     CHECK(hakios_metal_open() == nullptr);      // no kernel GPU on this machine
-    CHECK(hakios_metal_chip_known(0x06030500));  // this phone's
+    CHECK(hakios_metal_chip_known(0x06030500));  // the reference phone's
     CHECK(hakios_metal_chip_known(0));           // a kernel that does not say
-    CHECK(!hakios_metal_chip_known(0x06060000)); // another Adreno: the tables here would hang it
+    CHECK(hakios_metal_chip_known(0x06060010));  // the Mi 11 Lite 5G's (chip.hpp's second row)
+    CHECK(!hakios_metal_chip_known(0x06090000)); // another Adreno (an A690): the tables here would hang it
     CHECK(strlen(hakios_metal_error()) > 0);
 }
 

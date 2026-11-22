@@ -6,11 +6,16 @@
 #include <cstring>
 
 #include "hakios-metal/a6xx.hpp"
+#include "hakios-metal/chip.hpp"
 #include "hakios-metal/pm4.hpp"
 #include "test.hpp"
 
 using namespace hakios::metal::a6xx;
 namespace pm4 = hakios::metal::pm4;
+using hakios::metal::chip;
+using hakios::metal::chipFor;
+using hakios::metal::chipSelect;
+using hakios::metal::chipSetFromKernel;
 
 TEST(a6xx_type7_headers_for_the_dispatch_packets) {
     // CP_LOAD_STATE6_FRAG 0x34 = 011 0100, three ones: its bit (23) is 0. count 3 = 11, two ones: bit 15 is 1.
@@ -902,4 +907,48 @@ TEST(a6xx_first_draw_fs_input_output_and_raster_words) {
     CHECK_EQ(CP_DRAW_INDX_OFFSET_1_NUM_INSTANCES(1), 1u);
     CHECK_EQ(CP_DRAW_INDX_OFFSET_2_NUM_INDICES(3), 3u);
     CHECK_EQ(CP_DRAW_INDX_OFFSET_0_GS_ENABLE, 0x10000u);
+}
+
+// The two Adrenos this driver's tables are for (chip.hpp): the reference phone's and the Mi 11 Lite 5G's, each as Mesa's
+// freedreno_devices.py writes the row, and the arithmetic a render pass plans with.
+TEST(the_chips_tables_are_the_phones_own) {
+    const hakios::metal::Chip* reference = chipFor(0x06030500);
+    const hakios::metal::Chip* renoir = chipFor(0x06060010);
+    CHECK(reference != nullptr && renoir != nullptr);
+    // Mesa matches a row whose low byte is 0xff on the upper 24 bits: GPUId(660) is 0x060600ff, and the phone says
+    // 0x06060010
+    CHECK(chipFor(0x06060000) == renoir);
+    CHECK(chipFor(0x06090000) == nullptr);        // an A690: no row, the driver refuses it
+    CHECK(chipFor(0) == nullptr);
+
+    CHECK_EQ(reference->numCcu, 2u);
+    CHECK_EQ(reference->tileAlignW, 32u);
+    CHECK_EQ(reference->gmemBytes, 512u * 1024);
+    CHECK_EQ(reference->highestBankBit, 14u);
+    // 512 KiB below the CCU's colour cache: 2 CCUs of 64 KiB, a quarter of it
+    CHECK_EQ(reference->gmemCcuColorOffset(), 512u * 1024 - 2 * 64u * 1024 / 4);
+
+    CHECK_EQ(renoir->numCcu, 3u);
+    CHECK_EQ(renoir->numSpCores, 3u);
+    CHECK_EQ(renoir->tileAlignW, 96u);            // three CCUs of 32, so not a power of two
+    CHECK_EQ(renoir->gmemBytes, 1024u * 1024 + 512u * 1024);
+    CHECK_EQ(renoir->gmemCcuColorOffset(), (1024u * 1024 + 512u * 1024) - 3 * 64u * 1024 / 4);
+    // what both share, and what the emitters read from the selected row
+    CHECK_EQ(renoir->instrCacheSize, reference->instrCacheSize);
+    CHECK_EQ(renoir->fibersPerSp, reference->fibersPerSp);
+    CHECK_EQ(renoir->threadsizeBase, reference->threadsizeBase);
+    CHECK_EQ(renoir->tileMaxW, reference->tileMaxW);
+
+    // the selected row is the reference phone's until one is chosen, and the kernel's word on the two numbers it knows
+    // better wins over the row's
+    CHECK_EQ(chip().chipId, 0x06030500u);
+    CHECK(chipSelect(0x06060010));
+    CHECK_EQ(chip().chipId, 0x06060010u);
+    CHECK_EQ(chip().gmemBytes, 1024u * 1024 + 512u * 1024);
+    chipSetFromKernel(1024u * 1024 + 512u * 1024, 15);   // what renoir's kernel answers: the device tree's bank bit
+    CHECK_EQ(chip().highestBankBit, 15u);
+    CHECK(!chipSelect(0x06090000));                       // refused, and the row stays
+    CHECK_EQ(chip().chipId, 0x06060010u);
+    CHECK(chipSelect(0x06030500));                        // back for the tests that follow
+    CHECK_EQ(chip().chipId, 0x06030500u);
 }
