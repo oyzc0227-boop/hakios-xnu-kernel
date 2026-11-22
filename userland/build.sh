@@ -275,7 +275,9 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 				METAL_GPU="-DHAKIOS_METAL_GPU -I$HM/include $HM_OUT/libhakios-metal.a -lc++ -framework IOKit -framework IOSurface"
 				# built with its compiler (make ios MESA=1): Mesa's archives of our iOS build too, as hakios-metal's
 				# tools/compiler.mk lists them (HAKIOS_METAL_IOS_MESA_LIBS)
-				if nm -g $HM_OUT/libhakios-metal.a 2>/dev/null | grep -q " U _air_"; then
+				# (llvm-nm reads the archive's Mach-O members; binutils' nm does not, and answers nothing)
+				NM=$(command -v llvm-nm || echo nm)
+				if $NM -g $HM_OUT/libhakios-metal.a 2>/dev/null | grep -q " U _air_"; then
 					MB=../xnu-deps/build/mesa/build-softpipe-freedreno
 					for a in src/compiler/air/libair.a src/freedreno/ir3/libfreedreno_ir3.a src/freedreno/isa/libir3encode.a \
 					    src/freedreno/isa/libir3decode.a src/compiler/isaspec/libisaspec.a src/compiler/nir/libnir.a \
