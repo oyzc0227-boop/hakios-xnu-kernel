@@ -1945,6 +1945,9 @@ struct gpu_hw {
 	uint32_t gmem_size;
 	unsigned highest_bank_bit, ubwc_mode, min_access_length;
 
+	/* the core's primitive fifo threshold (the vendor's a6xx_core->prim_fifo_threshold), in PC_DBG_ECO_CNTL */
+	uint32_t prim_fifo_threshold;
+
 	/* the 3D core's speeds, lowest first, row 0 being "off" */
 	struct {
 		uint32_t khz, level;
@@ -1961,6 +1964,7 @@ static const struct gpu_hw hw_redwood = {
 	.chip_raw = 0x06030500ull,
 	.gmem_size = 512 * 1024,
 	.highest_bank_bit = 14, .ubwc_mode = 4, .min_access_length = 32,
+	.prim_fifo_threshold = 0x00200000,
 	.speeds = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } },
 	.speeds_count = 4,
 	.speed_wanted = 3,
@@ -1973,6 +1977,7 @@ static const struct gpu_hw hw_renoir = {
 	.chip_raw = 0x06060010ull,
 	.gmem_size = 1024 * 1024 + 512 * 1024,  /* the vendor's a642: SZ_1M + SZ_512K */
 	.highest_bank_bit = 15, .ubwc_mode = 4, .min_access_length = 32,
+	.prim_fifo_threshold = 0x00300000,      /* the vendor's a642/a660 core */
 	.speeds = {
 		{ 0, 0 },
 		{ 285000, 64 },                 /* qcom,gpu-pwrlevel@7: LOW_SVS */
@@ -2908,7 +2913,8 @@ step_core_start(void)
 	put(&gpu, "cp_roq_thresholds_1", CP_ROQ_THRESHOLDS_1, 0x8040362c);
 	put(&gpu, "cp_lpac_prog_fifo_size", CP_LPAC_PROG_FIFO_SIZE, 0x20);
 	put(&gpu, "cp_mem_pool_size", CP_MEM_POOL_SIZE, 128);
-	put(&gpu, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, 0x00200200);
+	/* the primitive fifo's threshold, and bit 9: TSEskip off, which both of this driver's chips want */
+	put(&gpu, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, hw->prim_fifo_threshold | 1u << 9);
 	put(&gpu, "cp_ahb_cntl", CP_AHB_CNTL, 1);
 	/*
 	 * How textures in the GPU's own tiled and compressed layouts are laid out in memory, as the
