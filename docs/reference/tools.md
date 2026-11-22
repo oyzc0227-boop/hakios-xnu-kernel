@@ -43,6 +43,7 @@ Every `make` target is a script below it; run the script itself for its options 
 | `metallib-test.sh`, `metal-plugin-test.sh` | the Metal plug-in's reading of libraries and its objects, under sanitizers | [Metal plan](../metal-plan.md) |
 | `metal-run.sh` | one Metal run on the phone, measured, with a summary in `logs/` | [Metal](metal.md#measure) |
 | `frames.py` | how evenly the frames of a run's gestures came, and what held up the slow ones | [Metal](metal.md#measure) |
+| `pngstat.py` | what a screenshot holds: the share of it that is not black, and how many colours | |
 | `ca-metallib.py` | QuartzCore's `default.metallib` for the window server, on your machine, from what you supply | [Metal](metal.md#the-window-server-userlandsrchakiosmetalcam) |
 | `metal-cache-seed.sh` | the window server's compiled shader stages off the phone, into the next image | [Windows](../windows.md#metal-a-run-measured-from-windows) |
 | `mk-mesa.sh`, `mk-turnip.sh` | Mesa 25.0.7 for the Darwin user space, and its Vulkan driver | [Metal](metal.md#build) |
